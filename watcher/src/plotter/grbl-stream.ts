@@ -36,7 +36,13 @@ export async function streamOverTcp(lines: string[], host: string, port: number)
       if (reply.toLowerCase().startsWith('error')) {
         pendingReject?.(new Error(`GRBL rejected line: ${reply}`))
         pendingResolve = pendingReject = null
-      } else if (reply === 'ok' || reply.toLowerCase().startsWith('grbl')) {
+      } else if (reply === 'ok') {
+        // STRICTLY 'ok' — GRBL answers exactly one ok/error per line sent.
+        // The startup banner ("Grbl 1.1 ...") must NOT count as an ack: the
+        // first version here accepted it, which shifted every subsequent ack
+        // by one line — the job finished one ok early (last stroke's ack
+        // never awaited) and an error aborted one line too late. Caught by
+        // the fake-board test before any real card was ever cut short.
         pendingResolve?.(reply)
         pendingResolve = pendingReject = null
       }
