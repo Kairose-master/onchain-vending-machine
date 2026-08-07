@@ -35,8 +35,15 @@ export async function main() {
   async function poll() {
     try {
       const latest = await client.getBlockNumber()
-      const cursor = BigInt(state.lastScannedBlock)
-      const from = cursor > BigInt(config.scanWindowBlocks) ? cursor - BigInt(config.scanWindowBlocks) : 0n
+      // Window is anchored to LATEST, never to the stored cursor: the first
+      // run (cursor 0) or a long-offline gap would otherwise ask the RPC for
+      // millions of blocks — the public Base Sepolia endpoint rejects
+      // anything over 2000 (verified live). The flip side is stated, not
+      // hidden: a payment older than the window that arrived while the
+      // watcher was DOWN is missed. For a booth, the watcher runs while the
+      // booth does, so the window only needs to cover a restart.
+      const window = BigInt(Math.min(config.scanWindowBlocks, 1999))
+      const from = latest > window ? latest - window : 0n
       const payments = await scanTransfers(client, from, latest)
       let queue = state.queue
       for (const p of payments) queue = enqueueIfNew(queue, p, config.priceBaseUnits)
