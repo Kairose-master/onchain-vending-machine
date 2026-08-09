@@ -2,7 +2,7 @@
  * The full text→motion pipeline, as one call. server.ts invokes this when
  * a paid credit is redeemed with a phrase.
  */
-import { loadFont, pickFont, textToPolylines } from './text-to-strokes'
+import { bestLayout, loadFont, pickFont } from './text-to-strokes'
 import { imageToPolylines } from './image-to-strokes'
 import { polylinesToGcode, DEFAULT_GCODE_CONFIG, type GcodeConfig, type GcodeResult, type Polyline } from './gcode'
 import { streamOverSerial, streamOverTcp, writeGcodeFile } from './grbl-stream'
@@ -58,7 +58,13 @@ export async function textStrokes(text: string, env: PlotterEnv): Promise<Polyli
     env.fontPath.split(',').map((p) => p.trim()).filter(Boolean).map((p) => loadFont(p)),
   )
   const font = pickFont(fonts, trimmed)
-  const polylines = textToPolylines(font, trimmed, { fontSize: env.fontSize })
+  // Auto-wrap to fill the paper: the drawable aspect decides how many lines
+  // sit largest (see bestLayout). Explicit \n from the customer wins.
+  const drawable = {
+    width: env.gcode.workAreaMm.width - 2 * env.gcode.marginMm,
+    height: env.gcode.workAreaMm.height - 2 * env.gcode.marginMm,
+  }
+  const polylines = bestLayout(font, trimmed, { fontSize: env.fontSize }, drawable)
   if (polylines.length === 0) {
     // Real case: text made entirely of characters NO font in the chain has
     // glyphs for. Refusing beats plotting a row of .notdef boxes on a paid

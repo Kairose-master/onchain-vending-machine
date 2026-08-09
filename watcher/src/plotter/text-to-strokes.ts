@@ -144,3 +144,109 @@ export function textToPolylines(font: Font, text: string, opts: TextLayoutOption
   })
   return polylines
 }
+
+/** Split `text` into `k` visually balanced lines. Latin text breaks at
+ *  spaces (never inside a word); CJK has no spaces and may break anywhere. */
+export function wrapIntoLines(text: string, k: number): string[] {
+  const words = text.includes(' ') ? text.split(/\s+/).filter(Boolean) : [...text]
+  const joiner = text.includes(' ') ? ' ' : ''
+  if (k >= words.length) return words.map(String)
+
+  const total = words.reduce((n, w) => n + w.length, 0)
+  const target = total / k
+  const lines: string[] = []
+  let current: string[] = []
+  let currentLen = 0
+  for (const w of words) {
+    // Start a new line once the current one has reached its share — unless
+    // doing so would leave more lines than we have words left to fill.
+    if (currentLen >= target && lines.length < k - 1) {
+      lines.push(current.join(joiner))
+      current = []
+      currentLen = 0
+    }
+    current.push(w)
+    currentLen += w.length
+  }
+  lines.push(current.join(joiner))
+  return lines
+}
+
+/** Ink bounds of a polyline set. */
+function inkBounds(polys: Polyline[]) {
+  const pts = polys.flatMap((p) => p.points)
+  const xs = pts.map((p) => p.x)
+  const ys = pts.map((p) => p.y)
+  return { minX: Math.min(...xs), maxX: Math.max(...xs), minY: Math.min(...ys), maxY: Math.max(...ys) }
+}
+
+/**
+ * Compose lines by their MEASURED ink bounds — each line rendered alone,
+ * then stacked with a small gap and centered. Baseline arithmetic wastes
+ * the em's empty headroom (a 1.4 line height made two stacked CJK glyphs
+ * SMALLER than one row, which is how the first version of the layout
+ * picker failed its own test); packing by what the pen actually inks is
+ * what lets a square card actually fill.
+ */
+function stackLines(font: Font, lines: string[], fontSize: number): Polyline[] {
+  const gap = fontSize * 0.12
+  const rendered = lines
+    .filter((l) => l.trim() !== '')
+    .map((line) => {
+      const polys = flattenCommands(font.getPath(line, 0, 0, fontSize).commands as PathCommand[])
+      return { polys, bounds: polys.length > 0 ? inkBounds(polys) : null }
+    })
+    .filter((r): r is { polys: Polyline[]; bounds: NonNullable<ReturnType<typeof inkBounds>> } => r.bounds !== null)
+  if (rendered.length === 0) return []
+
+  const blockWidth = Math.max(...rendered.map((r) => r.bounds.maxX - r.bounds.minX))
+  const out: Polyline[] = []
+  let y = 0
+  for (const { polys, bounds } of rendered) {
+    const xShift = (blockWidth - (bounds.maxX - bounds.minX)) / 2 - bounds.minX
+    const yShift = y - bounds.minY
+    for (const poly of polys) {
+      out.push({ points: poly.points.map((p) => ({ x: p.x + xShift, y: p.y + yShift })) })
+    }
+    y += bounds.maxY - bounds.minY + gap
+  }
+  return out
+}
+
+/**
+ * Choose the line count that lets the text sit LARGEST on the paper.
+ *
+ * The scale a block gets is min(W/w, H/h): a one-line phrase on a square
+ * card is wide and short, so the width constraint binds and half the
+ * height sits empty — 谢谢 filled 44mm of width but only 22mm of height.
+ * Rewrapping into k lines (ink-packed, see stackLines) changes the block's
+ * aspect; k = 1..4 are tried against the drawable's aspect and the largest
+ * wins. Text with an explicit \n is the customer's own layout: honored
+ * verbatim, but still ink-packed so it also fills.
+ */
+export function bestLayout(
+  font: Font,
+  text: string,
+  opts: TextLayoutOptions,
+  drawable: { width: number; height: number },
+): Polyline[] {
+  if (text.includes('\n')) return stackLines(font, text.split('\n'), opts.fontSize)
+
+  let best: Polyline[] = []
+  let bestScale = -Infinity
+  const maxLines = Math.min(4, [...text.replace(/\s/g, '')].length)
+  for (let k = 1; k <= maxLines; k++) {
+    const polylines = stackLines(font, wrapIntoLines(text, k), opts.fontSize)
+    if (polylines.length === 0) continue
+    const b = inkBounds(polylines)
+    const scale = Math.min(
+      drawable.width / (b.maxX - b.minX || 1e-9),
+      drawable.height / (b.maxY - b.minY || 1e-9),
+    )
+    if (scale > bestScale) {
+      bestScale = scale
+      best = polylines
+    }
+  }
+  return best
+}

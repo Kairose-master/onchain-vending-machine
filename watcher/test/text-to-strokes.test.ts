@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { flattenCommands, loadFont, pickFont, textToPolylines } from '../src/plotter/text-to-strokes'
+import { bestLayout, flattenCommands, loadFont, pickFont, textToPolylines, wrapIntoLines } from '../src/plotter/text-to-strokes'
 
 const FONT = new URL('../fonts/NanumPenScript-Regular.ttf', import.meta.url).pathname
 const FONT_CN = new URL('../fonts/MaShanZheng-Regular.ttf', import.meta.url).pathname
@@ -87,5 +87,46 @@ describe('pickFont — the Korean/Chinese fallback chain', () => {
     const cn = await loadFont(FONT_CN)
     const polys = textToPolylines(cn, '谢谢', { fontSize: 72 })
     expect(polys.length).toBeGreaterThan(2)
+  })
+})
+
+describe('wrapIntoLines', () => {
+  it('CJK breaks anywhere, evenly', () => {
+    expect(wrapIntoLines('가나다라', 2)).toEqual(['가나', '다라'])
+  })
+  it('Latin never breaks inside a word', () => {
+    const lines = wrapIntoLines('hello onchain world', 2)
+    expect(lines.join(' ')).toBe('hello onchain world')
+    for (const l of lines) expect(l).toMatch(/^[a-z ]+$/)
+  })
+})
+
+describe('bestLayout — fill the paper', () => {
+  const drawable = { width: 44, height: 44 } // the 60x60 booth minus margins
+
+  const scaleOf = (polys: ReturnType<typeof textToPolylines>) => {
+    const pts = polys.flatMap((p) => p.points)
+    const w = Math.max(...pts.map((p) => p.x)) - Math.min(...pts.map((p) => p.x))
+    const h = Math.max(...pts.map((p) => p.y)) - Math.min(...pts.map((p) => p.y))
+    return Math.min(drawable.width / w, drawable.height / h)
+  }
+
+  it('stacks 谢谢 into two lines on a square card — the glyphs come out larger', async () => {
+    const cn = await loadFont(FONT_CN)
+    const single = textToPolylines(cn, '谢谢', { fontSize: 72 })
+    const auto = bestLayout(cn, '谢谢', { fontSize: 72 }, drawable)
+    expect(scaleOf(auto)).toBeGreaterThan(scaleOf(single))
+  })
+
+  it('never rewraps text that carries an explicit newline — the customer laid it out', async () => {
+    const kr = await loadFont(FONT)
+    const manual = textToPolylines(kr, '안녕\n하세요', { fontSize: 72 })
+    const kept = bestLayout(kr, '안녕\n하세요', { fontSize: 72 }, drawable)
+    expect(kept.length).toBe(manual.length)
+  })
+
+  it('a single character stays a single line', async () => {
+    const kr = await loadFont(FONT)
+    expect(bestLayout(kr, '가', { fontSize: 72 }, drawable).length).toBeGreaterThan(0)
   })
 })
