@@ -31,7 +31,7 @@ interface DuplexLike {
  * implementation of the ack accounting — the off-by-one class of bug only
  * has one place to live.
  */
-async function runProtocol(stream: DuplexLike, lines: string[]): Promise<void> {
+export async function runProtocol(stream: DuplexLike, lines: string[], opts: { bootHandshake?: boolean } = {}): Promise<void> {
   let buffer = ''
   let pendingResolve: ((reply: string) => void) | null = null
   let pendingReject: ((err: Error) => void) | null = null
@@ -60,17 +60,37 @@ async function runProtocol(stream: DuplexLike, lines: string[]): Promise<void> {
     }
   })
 
-  const waitReply = () =>
+  const waitReply = (timeoutMs = LINE_TIMEOUT_MS) =>
     new Promise<string>((resolve, reject) => {
       pendingResolve = resolve
       pendingReject = reject
       setTimeout(() => {
         if (pendingResolve === resolve) {
           pendingResolve = pendingReject = null
-          reject(new Error(`GRBL did not answer within ${LINE_TIMEOUT_MS}ms`))
+          reject(new Error(`GRBL did not answer within ${timeoutMs}ms`))
         }
-      }, LINE_TIMEOUT_MS)
+      }, timeoutMs)
     })
+
+  if (opts.bootHandshake) {
+    // GRBL answers a bare newline with "ok". Poke until it does: the ESP32's
+    // auto-reset boot time varies, and a line sent mid-boot is silently
+    // dropped — the second-ever real plot deadlocked exactly this way,
+    // waiting 30s for an ack to a line the board never saw. A fixed settle
+    // delay is a guess; a handshake is an answer.
+    let awake = false
+    for (let attempt = 0; attempt < 10 && !awake; attempt++) {
+      try {
+        const reply = waitReply(2000)
+        stream.write('\n')
+        await reply
+        awake = true
+      } catch {
+        /* still booting — poke again */
+      }
+    }
+    if (!awake) throw new Error('GRBL never woke up after 10 handshake attempts — check power and port')
+  }
 
   for (const line of lines) {
     const replyPromise = waitReply()
@@ -115,10 +135,9 @@ export async function streamOverSerial(lines: string[], path: string, baudRate =
     port.once('open', () => resolve())
     port.once('error', reject)
   })
-  await new Promise((r) => setTimeout(r, 2000)) // board reboot settle
 
   try {
-    await runProtocol(port, lines)
+    await runProtocol(port, lines, { bootHandshake: true })
   } finally {
     port.close()
   }
