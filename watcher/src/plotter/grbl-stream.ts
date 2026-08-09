@@ -136,15 +136,35 @@ export async function streamOverSerial(lines: string[], path: string, baudRate =
     port.once('error', reject)
   })
 
-  // Release DTR/RTS explicitly. ESP32 dev boards wire these lines to the
-  // chip's reset (EN) and boot-select (IO0) pins; node-serialport's open
-  // defaults can leave them asserted, which HOLDS THE CHIP IN RESET — the
-  // board never boots, so even the handshake pokes go unanswered forever.
-  // `screen` happens to leave the lines in a bootable state, which is why
-  // the same cable + same board talked fine there and not here.
-  await new Promise<void>((resolve, reject) =>
-    port.set({ dtr: false, rts: false }, (err: Error | null | undefined) => (err ? reject(err) : resolve())),
-  )
+  // ESP32 dev boards wire DTR/RTS to the chip's reset (EN) and boot-select
+  // (IO0) pins, and WHICH line state lets the chip boot depends on the
+  // carrier board's wiring — deasserting helped one board and holds
+  // another in reset. `screen` (which is known to work with this board)
+  // ASSERTS both on open, so that's the default here; override with
+  // PLOTTER_DTR/PLOTTER_RTS=true|false|skip when a board disagrees.
+  const lineState = (name: string, fallback: boolean): boolean | null => {
+    const raw = process.env[name]?.trim().toLowerCase()
+    if (raw === 'skip') return null
+    if (raw === 'true') return true
+    if (raw === 'false') return false
+    return fallback
+  }
+  const dtr = lineState('PLOTTER_DTR', true)
+  const rts = lineState('PLOTTER_RTS', true)
+  if (dtr !== null && rts !== null) {
+    await new Promise<void>((resolve, reject) =>
+      port.set({ dtr, rts }, (err: Error | null | undefined) => (err ? reject(err) : resolve())),
+    )
+  }
+
+  // PLOTTER_DEBUG=1: dump every raw byte the board sends. The one signal
+  // that separates "board is silent" (line-state/boot problem) from "board
+  // is talking and we misparse it" (protocol problem).
+  if (process.env.PLOTTER_DEBUG === '1') {
+    port.on('data', (chunk: Buffer) => {
+      console.error(`[serial rx] ${JSON.stringify(chunk.toString())}`)
+    })
+  }
 
   try {
     await runProtocol(port, lines, { bootHandshake: true })
