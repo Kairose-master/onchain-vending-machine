@@ -38,6 +38,8 @@ export function plotterEnvFromProcess(env: NodeJS.ProcessEnv): PlotterEnv {
         : {}),
       ...(env.PEN_UP_CMD?.trim() ? { penUp: env.PEN_UP_CMD.trim() } : {}),
       ...(env.PEN_DOWN_CMD?.trim() ? { penDown: env.PEN_DOWN_CMD.trim() } : {}),
+      ...(Number(env.FEED_DRAW) > 0 ? { feedDrawMmMin: Number(env.FEED_DRAW) } : {}),
+      ...(Number(env.FEED_TRAVEL) > 0 ? { feedTravelMmMin: Number(env.FEED_TRAVEL) } : {}),
     },
   }
 }
