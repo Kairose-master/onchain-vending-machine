@@ -134,8 +134,25 @@ export function polylinesToGcode(input: Polyline[], config: GcodeConfig = DEFAUL
   let head = { x: 0, y: 0 }
   let outMinX = Infinity, outMinY = Infinity, outMaxX = -Infinity, outMaxY = -Infinity
 
+  // Decimate after scaling: consecutive points closer than this add no
+  // visible detail at pen width, but each one is a G-code line the motors
+  // must start and stop for. Dense CJK glyphs arrive as thousands of
+  // sub-0.1mm segments, and small steppers lose steps trying to follow
+  // them at speed — 谢谢 came off the real machine shrunken and tangled
+  // while the same program rendered perfectly in preview. Fewer, slightly
+  // longer segments is what the physical machine can actually execute.
+  const MIN_SEGMENT_MM = 0.15
+  const decimate = (pts: Array<{ x: number; y: number }>): Array<{ x: number; y: number }> => {
+    const out = [pts[0]]
+    for (let i = 1; i < pts.length - 1; i++) {
+      if (dist(out[out.length - 1], pts[i]) >= MIN_SEGMENT_MM) out.push(pts[i])
+    }
+    if (pts.length > 1) out.push(pts[pts.length - 1])
+    return out
+  }
+
   for (const poly of polylines) {
-    const mapped = poly.points.map(map)
+    const mapped = decimate(poly.points.map(map))
     for (const pt of mapped) {
       outMinX = Math.min(outMinX, pt.x); outMaxX = Math.max(outMaxX, pt.x)
       outMinY = Math.min(outMinY, pt.y); outMaxY = Math.max(outMaxY, pt.y)
