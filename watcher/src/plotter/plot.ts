@@ -2,7 +2,7 @@
  * The full text→motion pipeline, as one call. server.ts invokes this when
  * a paid credit is redeemed with a phrase.
  */
-import { loadFont, textToPolylines } from './text-to-strokes'
+import { loadFont, pickFont, textToPolylines } from './text-to-strokes'
 import { imageToPolylines } from './image-to-strokes'
 import { polylinesToGcode, DEFAULT_GCODE_CONFIG, type GcodeConfig, type GcodeResult, type Polyline } from './gcode'
 import { streamOverSerial, streamOverTcp, writeGcodeFile } from './grbl-stream'
@@ -22,7 +22,8 @@ export interface PlotterEnv {
 
 export function plotterEnvFromProcess(env: NodeJS.ProcessEnv): PlotterEnv {
   return {
-    fontPath: env.FONT_PATH?.trim() || './fonts/NanumPenScript-Regular.ttf',
+    // Comma-separated fallback chain; pickFont chooses per phrase.
+    fontPath: env.FONT_PATH?.trim() || './fonts/NanumPenScript-Regular.ttf,./fonts/MaShanZheng-Regular.ttf',
     fontSize: Number(env.FONT_SIZE ?? 72),
     tcpTarget: env.PLOTTER_TCP?.trim() || '',
     serialTarget: env.PLOTTER_SERIAL?.trim() || '',
@@ -45,16 +46,21 @@ export type PlotOutcome =
   | { ok: true; mode: 'machine' | 'dry-run'; detail: string; stats: GcodeResult['stats'] }
   | { ok: false; reason: string }
 
-/** Text lane: phrase → glyph outlines. */
+/** Text lane: phrase → glyph outlines, via the best-covering font in the
+ *  chain (see pickFont — Korean and Chinese handwriting faces coexist). */
 export async function textStrokes(text: string, env: PlotterEnv): Promise<Polyline[] | { error: string }> {
   const trimmed = text.trim()
   if (!trimmed) return { error: 'empty text' }
   if (trimmed.length > 80) return { error: 'text too long (max 80 chars) — a postcard is small' }
-  const font = await loadFont(env.fontPath)
+  const fonts = await Promise.all(
+    env.fontPath.split(',').map((p) => p.trim()).filter(Boolean).map((p) => loadFont(p)),
+  )
+  const font = pickFont(fonts, trimmed)
   const polylines = textToPolylines(font, trimmed, { fontSize: env.fontSize })
   if (polylines.length === 0) {
-    // Real case: text made entirely of characters the font has no glyphs
-    // for. Refusing beats plotting a row of .notdef boxes on a paid card.
+    // Real case: text made entirely of characters NO font in the chain has
+    // glyphs for. Refusing beats plotting a row of .notdef boxes on a paid
+    // card.
     return { error: 'no drawable strokes for this text (unsupported characters?)' }
   }
   return polylines

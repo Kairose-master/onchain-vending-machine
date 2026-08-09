@@ -82,17 +82,42 @@ export function flattenCommands(commands: PathCommand[]): Polyline[] {
   return polylines
 }
 
-let cachedFont: { path: string; font: Font } | null = null
+const fontCache = new Map<string, Font>()
 
 export async function loadFont(fontPath: string): Promise<Font> {
-  if (cachedFont?.path === fontPath) return cachedFont.font
+  const cached = fontCache.get(fontPath)
+  if (cached) return cached
   const buf = await readFile(fontPath)
   // opentype wants an ArrayBuffer that is exactly the file — a Node Buffer
   // can be a view into a larger pool, so slice to the view's bounds.
   const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength)
   const font = opentype.parse(ab)
-  cachedFont = { path: fontPath, font }
+  fontCache.set(fontPath, font)
   return font
+}
+
+/**
+ * Pick the font that can actually draw this text: highest glyph coverage
+ * wins, earlier fonts win ties. A Korean handwriting face has no hanzi and
+ * a Chinese one no hangul — a booth in either country meets both scripts,
+ * so the chain (FONT_PATH is comma-separated) decides per phrase, not per
+ * deployment. Whole-phrase selection on purpose: mixing two fonts inside
+ * one card would look like a ransom note.
+ */
+export function pickFont(fonts: Font[], text: string): Font {
+  if (fonts.length === 1) return fonts[0]
+  const chars = [...text].filter((c) => c.trim() !== '')
+  let best = fonts[0]
+  let bestCovered = -1
+  for (const font of fonts) {
+    // Glyph index 0 is .notdef — the "missing character" box.
+    const covered = chars.filter((c) => font.charToGlyph(c).index !== 0).length
+    if (covered > bestCovered) {
+      best = font
+      bestCovered = covered
+    }
+  }
+  return best
 }
 
 export interface TextLayoutOptions {

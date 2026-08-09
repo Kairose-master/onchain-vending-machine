@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { flattenCommands, loadFont, textToPolylines } from '../src/plotter/text-to-strokes'
+import { flattenCommands, loadFont, pickFont, textToPolylines } from '../src/plotter/text-to-strokes'
 
 const FONT = new URL('../fonts/NanumPenScript-Regular.ttf', import.meta.url).pathname
+const FONT_CN = new URL('../fonts/MaShanZheng-Regular.ttf', import.meta.url).pathname
 
 describe('flattenCommands', () => {
   it('turns move/line/close into a closed polyline', () => {
@@ -65,5 +66,26 @@ describe('textToPolylines with the real booth font', () => {
   it('whitespace-only text yields no strokes rather than an empty plot', async () => {
     const font = await loadFont(FONT)
     expect(textToPolylines(font, '   \n  ', { fontSize: 72 })).toEqual([])
+  })
+})
+
+describe('pickFont — the Korean/Chinese fallback chain', () => {
+  it('picks the Korean face for hangul and the Chinese face for hanzi', async () => {
+    const kr = await loadFont(FONT)
+    const cn = await loadFont(FONT_CN)
+    expect(pickFont([kr, cn], '안녕하세요')).toBe(kr)
+    expect(pickFont([kr, cn], '谢谢')).toBe(cn)
+  })
+
+  it('earlier font wins ties (Latin text both fonts cover)', async () => {
+    const kr = await loadFont(FONT)
+    const cn = await loadFont(FONT_CN)
+    expect(pickFont([kr, cn], 'hello')).toBe(kr)
+  })
+
+  it('the Chinese face actually yields strokes for 谢谢 — the exact phrase that failed on the booth', async () => {
+    const cn = await loadFont(FONT_CN)
+    const polys = textToPolylines(cn, '谢谢', { fontSize: 72 })
+    expect(polys.length).toBeGreaterThan(2)
   })
 })
