@@ -136,6 +136,16 @@ export async function streamOverSerial(lines: string[], path: string, baudRate =
     port.once('error', reject)
   })
 
+  // Release DTR/RTS explicitly. ESP32 dev boards wire these lines to the
+  // chip's reset (EN) and boot-select (IO0) pins; node-serialport's open
+  // defaults can leave them asserted, which HOLDS THE CHIP IN RESET — the
+  // board never boots, so even the handshake pokes go unanswered forever.
+  // `screen` happens to leave the lines in a bootable state, which is why
+  // the same cable + same board talked fine there and not here.
+  await new Promise<void>((resolve, reject) =>
+    port.set({ dtr: false, rts: false }, (err: Error | null | undefined) => (err ? reject(err) : resolve())),
+  )
+
   try {
     await runProtocol(port, lines, { bootHandshake: true })
   } finally {
