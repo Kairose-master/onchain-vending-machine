@@ -18,16 +18,26 @@ import { dirname } from 'node:path'
 
 const LINE_TIMEOUT_MS = 30_000
 
-export async function streamOverTcp(lines: string[], host: string, port: number): Promise<void> {
-  const socket = createConnection({ host, port })
-  socket.setEncoding('utf8')
+/** The bit of a transport this protocol actually needs — satisfied by a
+ *  net.Socket and by a serialport instance alike. */
+interface DuplexLike {
+  on(event: 'data', handler: (chunk: Buffer | string) => void): unknown
+  write(data: string): unknown
+}
 
+/**
+ * Drive the line-per-ok protocol over any duplex byte stream.
+ * Transport-agnostic so TCP (WiFi boards) and USB serial share ONE
+ * implementation of the ack accounting — the off-by-one class of bug only
+ * has one place to live.
+ */
+async function runProtocol(stream: DuplexLike, lines: string[]): Promise<void> {
   let buffer = ''
   let pendingResolve: ((reply: string) => void) | null = null
   let pendingReject: ((err: Error) => void) | null = null
 
-  socket.on('data', (chunk: string) => {
-    buffer += chunk
+  stream.on('data', (chunk: Buffer | string) => {
+    buffer += chunk.toString()
     let idx: number
     while ((idx = buffer.indexOf('\n')) !== -1) {
       const reply = buffer.slice(0, idx).trim()
@@ -62,19 +72,55 @@ export async function streamOverTcp(lines: string[], host: string, port: number)
       }, LINE_TIMEOUT_MS)
     })
 
+  for (const line of lines) {
+    const replyPromise = waitReply()
+    stream.write(line + '\n')
+    await replyPromise
+  }
+}
+
+export async function streamOverTcp(lines: string[], host: string, port: number): Promise<void> {
+  const socket = createConnection({ host, port })
+  socket.setEncoding('utf8')
+
   await new Promise<void>((resolve, reject) => {
     socket.once('connect', () => resolve())
     socket.once('error', reject)
   })
 
   try {
-    for (const line of lines) {
-      const replyPromise = waitReply()
-      socket.write(line + '\n')
-      await replyPromise
-    }
+    await runProtocol(socket, lines)
   } finally {
     socket.end()
+  }
+}
+
+/**
+ * USB serial transport (e.g. /dev/cu.usbserial-10 on macOS).
+ *
+ * One quirk TCP doesn't have: ESP32 dev boards AUTO-RESET when the serial
+ * port opens (DTR toggle), so the board reboots the moment we connect. The
+ * settle delay lets it finish booting and spit its banner before the first
+ * real line goes out — without it the first commands land on a board that
+ * is mid-reboot and vanish unacked.
+ */
+export async function streamOverSerial(lines: string[], path: string, baudRate = 115200): Promise<void> {
+  // Dynamic import: serialport is a native module that only matters on the
+  // machine physically attached to the plotter; the watcher runs fine
+  // without it in TCP/dry-run modes.
+  const { SerialPort } = await import('serialport')
+  const port = new SerialPort({ path, baudRate })
+
+  await new Promise<void>((resolve, reject) => {
+    port.once('open', () => resolve())
+    port.once('error', reject)
+  })
+  await new Promise((r) => setTimeout(r, 2000)) // board reboot settle
+
+  try {
+    await runProtocol(port, lines)
+  } finally {
+    port.close()
   }
 }
 

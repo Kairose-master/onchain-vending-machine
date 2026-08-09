@@ -4,13 +4,17 @@
  */
 import { loadFont, textToPolylines } from './text-to-strokes'
 import { polylinesToGcode, DEFAULT_GCODE_CONFIG, type GcodeConfig, type GcodeResult } from './gcode'
-import { streamOverTcp, writeGcodeFile } from './grbl-stream'
+import { streamOverSerial, streamOverTcp, writeGcodeFile } from './grbl-stream'
 
 export interface PlotterEnv {
   fontPath: string
   fontSize: number
-  /** "host:port" of the ESP32 GRBL board, or empty for dry-run-to-file. */
+  /** "host:port" of the ESP32 GRBL board over WiFi, or empty. */
   tcpTarget: string
+  /** Serial device of the board over USB (e.g. /dev/cu.usbserial-10), or
+   *  empty. Serial wins when both are set — a plugged cable is the more
+   *  deliberate signal. Neither set = dry-run to file. */
+  serialTarget: string
   dryRunDir: string
   gcode: GcodeConfig
 }
@@ -20,6 +24,7 @@ export function plotterEnvFromProcess(env: NodeJS.ProcessEnv): PlotterEnv {
     fontPath: env.FONT_PATH?.trim() || './fonts/NanumPenScript-Regular.ttf',
     fontSize: Number(env.FONT_SIZE ?? 72),
     tcpTarget: env.PLOTTER_TCP?.trim() || '',
+    serialTarget: env.PLOTTER_SERIAL?.trim() || '',
     dryRunDir: env.DRY_RUN_DIR?.trim() || './out',
     gcode: {
       ...DEFAULT_GCODE_CONFIG,
@@ -53,6 +58,11 @@ export async function plotText(text: string, env: PlotterEnv): Promise<PlotOutco
   }
 
   const result = polylinesToGcode(polylines, env.gcode)
+
+  if (env.serialTarget) {
+    await streamOverSerial(result.lines, env.serialTarget)
+    return { ok: true, mode: 'machine', detail: env.serialTarget, stats: result.stats }
+  }
 
   if (env.tcpTarget) {
     const [host, portRaw] = env.tcpTarget.split(':')

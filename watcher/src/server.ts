@@ -69,7 +69,7 @@ export async function main() {
     if (req.method === 'GET' && (req.url === '/' || req.url === '/kiosk')) {
       res.setHeader('content-type', 'text/html; charset=utf-8')
       res.writeHead(200)
-      res.end(kioskPage(state.queue.pending.length, plotterEnv.tcpTarget))
+      res.end(kioskPage(state.queue.pending.length, plotterEnv.serialTarget || plotterEnv.tcpTarget))
       return
     }
 
@@ -152,7 +152,12 @@ export async function main() {
 
   server.listen(config.port, () => {
     console.log(`[watcher] listening on :${config.port}, watching ${config.vendingWallet} for >= ${config.priceBaseUnits} USDC base units`)
-    console.log(`[plotter] ${plotterEnv.tcpTarget ? `machine at ${plotterEnv.tcpTarget}` : `dry-run → ${plotterEnv.dryRunDir}/`}`)
+    const target = plotterEnv.serialTarget
+      ? `machine at ${plotterEnv.serialTarget} (serial)`
+      : plotterEnv.tcpTarget
+        ? `machine at ${plotterEnv.tcpTarget} (wifi)`
+        : `dry-run → ${plotterEnv.dryRunDir}/`
+    console.log(`[plotter] ${target}`)
   })
 }
 
