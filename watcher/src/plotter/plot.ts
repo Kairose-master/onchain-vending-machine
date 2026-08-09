@@ -3,7 +3,8 @@
  * a paid credit is redeemed with a phrase.
  */
 import { loadFont, textToPolylines } from './text-to-strokes'
-import { polylinesToGcode, DEFAULT_GCODE_CONFIG, type GcodeConfig, type GcodeResult } from './gcode'
+import { imageToPolylines } from './image-to-strokes'
+import { polylinesToGcode, DEFAULT_GCODE_CONFIG, type GcodeConfig, type GcodeResult, type Polyline } from './gcode'
 import { streamOverSerial, streamOverTcp, writeGcodeFile } from './grbl-stream'
 
 export interface PlotterEnv {
@@ -44,18 +45,63 @@ export type PlotOutcome =
   | { ok: true; mode: 'machine' | 'dry-run'; detail: string; stats: GcodeResult['stats'] }
   | { ok: false; reason: string }
 
-export async function plotText(text: string, env: PlotterEnv): Promise<PlotOutcome> {
+/** Text lane: phrase → glyph outlines. */
+export async function textStrokes(text: string, env: PlotterEnv): Promise<Polyline[] | { error: string }> {
   const trimmed = text.trim()
-  if (!trimmed) return { ok: false, reason: 'empty text' }
-  if (trimmed.length > 80) return { ok: false, reason: 'text too long (max 80 chars) — a postcard is small' }
-
+  if (!trimmed) return { error: 'empty text' }
+  if (trimmed.length > 80) return { error: 'text too long (max 80 chars) — a postcard is small' }
   const font = await loadFont(env.fontPath)
   const polylines = textToPolylines(font, trimmed, { fontSize: env.fontSize })
   if (polylines.length === 0) {
     // Real case: text made entirely of characters the font has no glyphs
     // for. Refusing beats plotting a row of .notdef boxes on a paid card.
-    return { ok: false, reason: 'no drawable strokes for this text (unsupported characters?)' }
+    return { error: 'no drawable strokes for this text (unsupported characters?)' }
   }
+  return polylines
+}
+
+/** Image lane: uploaded bitmap → traced outlines. */
+export async function imageStrokes(imageBase64: string, threshold: number): Promise<Polyline[] | { error: string }> {
+  let buffer: Buffer
+  try {
+    buffer = Buffer.from(imageBase64.replace(/^data:image\/[a-z+]+;base64,/i, ''), 'base64')
+  } catch {
+    return { error: 'bad image data' }
+  }
+  if (buffer.length === 0) return { error: 'empty image' }
+  if (buffer.length > 8 * 1024 * 1024) return { error: 'image too large (max 8MB)' }
+  let polylines: Polyline[]
+  try {
+    polylines = await imageToPolylines(buffer, threshold)
+  } catch (err) {
+    return { error: `could not trace image: ${err instanceof Error ? err.message : String(err)}` }
+  }
+  if (polylines.length === 0) {
+    return { error: 'nothing traceable at this threshold — try adjusting it' }
+  }
+  return polylines
+}
+
+export interface PlotInput {
+  text?: string
+  imageBase64?: string
+  /** potrace threshold 0-255 for the image lane. */
+  threshold?: number
+}
+
+export async function plotInputToStrokes(input: PlotInput, env: PlotterEnv): Promise<Polyline[] | { error: string }> {
+  if (input.imageBase64) return imageStrokes(input.imageBase64, input.threshold ?? 160)
+  return textStrokes(input.text ?? '', env)
+}
+
+export async function plotText(text: string, env: PlotterEnv): Promise<PlotOutcome> {
+  return plot({ text }, env)
+}
+
+export async function plot(input: PlotInput, env: PlotterEnv): Promise<PlotOutcome> {
+  const strokes = await plotInputToStrokes(input, env)
+  if ('error' in strokes) return { ok: false, reason: strokes.error }
+  const polylines = strokes
 
   const result = polylinesToGcode(polylines, env.gcode)
 
