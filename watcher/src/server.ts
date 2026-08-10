@@ -13,6 +13,9 @@ import { createQueue, enqueueIfNew, dequeue, type QueueState } from './queue'
 import { plot, plotInputToStrokes, plotterEnvFromProcess, type PlotInput } from './plotter/plot'
 import { polylinesToGcode } from './plotter/gcode'
 import { gcodeToSvg } from './plotter/svg-preview'
+import { initHandsel } from './handsel/settle'
+import type { Card } from './handsel/protocol'
+import { randomUUID } from 'node:crypto'
 
 type Persisted = { queue: QueueState; lastScannedBlock: string }
 
@@ -65,13 +68,14 @@ export async function main() {
   setInterval(poll, config.pollIntervalMs)
 
   const plotterEnv = plotterEnvFromProcess(process.env)
+  const handsel = await initHandsel(process.env)
   let plotting = false
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     if (req.method === 'GET' && (req.url === '/' || req.url === '/kiosk')) {
       res.setHeader('content-type', 'text/html; charset=utf-8')
       res.writeHead(200)
-      res.end(kioskPage(state.queue.pending.length, plotterEnv.serialTarget || plotterEnv.tcpTarget))
+      res.end(kioskPage(state.queue.pending.length, plotterEnv.serialTarget || plotterEnv.tcpTarget, handsel.enabled))
       return
     }
 
@@ -80,6 +84,12 @@ export async function main() {
     if (req.method === 'GET' && req.url === '/dispense-queue') {
       res.writeHead(200)
       res.end(JSON.stringify({ pending: state.queue.pending.length }))
+      return
+    }
+
+    if (req.method === 'GET' && req.url === '/handsel/cards') {
+      res.writeHead(200)
+      res.end(JSON.stringify({ enabled: handsel.enabled, cards: handsel.cards() }))
       return
     }
 
@@ -148,8 +158,23 @@ export async function main() {
           saveState(state)
           const label = input.imageBase64 ? '<image upload>' : `"${(input.text ?? '').slice(0, 30)}"`
           console.log(`[plot] ${label} → ${outcome.mode} (${outcome.detail}) — paid by ${item?.txHash}`)
+          // Settle this card on the Handsel labor market — fire-and-forget:
+          // the customer already has their card; settlement failing must
+          // never claw that back or block the next customer.
+          let handselCardId: string | undefined
+          if (handsel.enabled) {
+            const card: Card = {
+              id: randomUUID().slice(0, 8),
+              kind: input.imageBase64 ? 'image' : 'text',
+              label: input.imageBase64 ? '이미지 카드' : (input.text ?? '').trim().slice(0, 80),
+              paymentTxHash: item?.txHash ?? 'unknown',
+              stats: outcome.stats,
+            }
+            handsel.settleCard(card)
+            handselCardId = card.id
+          }
           res.writeHead(200)
-          res.end(JSON.stringify({ ...outcome, paidBy: item?.txHash, remaining: nextQueue.pending.length }))
+          res.end(JSON.stringify({ ...outcome, paidBy: item?.txHash, remaining: nextQueue.pending.length, ...(handselCardId ? { handselCardId } : {}) }))
         } catch (err) {
           res.writeHead(502)
           res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }))
@@ -193,7 +218,7 @@ export async function main() {
 /** The booth's local kiosk page: queue status, text/image tabs, and a
  *  what-the-pen-will-draw preview. Plain HTML, no build step — it runs on
  *  the booth laptop, not the public internet. */
-function kioskPage(pending: number, tcpTarget: string): string {
+function kioskPage(pending: number, tcpTarget: string, handselEnabled: boolean): string {
   return `<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>onchain vending — kiosk</title>
@@ -214,6 +239,14 @@ function kioskPage(pending: number, tcpTarget: string): string {
   #stats { color: #666; font-size: .9rem; margin-top: .35rem; }
   #result { margin-top: 1rem; white-space: pre-wrap; font-family: monospace; font-size: .85rem; }
   label { font-size: .95rem; color: #444; }
+  .hcard { border: 1px solid #ddd; padding: .6rem .75rem; margin-top: .6rem; }
+  .hcard .hlabel { font-weight: bold; margin-bottom: .35rem; }
+  .chips { display: flex; flex-wrap: wrap; gap: .35rem; }
+  .chip { font-size: .8rem; padding: .15rem .5rem; border-radius: 999px; background: #eee; color: #444; }
+  .chip.done { background: #1a1a2e; color: #fff; }
+  .chip.bad { background: #c00; color: #fff; }
+  .chip.warn { background: #b8860b; color: #fff; }
+  .hdetail { font-size: .8rem; color: #888; margin-top: .3rem; }
 </style></head><body>
 <h1>결제 대기: <span class="badge" id="pending">${pending}</span></h1>
 <p>${tcpTarget ? `기계 연결: ${tcpTarget}` : '드라이런 모드 (기계 미연결 — G-code 파일로 저장)'}</p>
@@ -244,6 +277,8 @@ function kioskPage(pending: number, tcpTarget: string): string {
 <div id="stats"></div>
 <div id="result"></div>
 
+${handselEnabled ? '<h2 style="margin-top:1.5rem">Handsel 정산 <span style="font-size:.8rem;color:#888;font-weight:normal">카드 1장 = 라이브 잡 1건</span></h2><div id="handsel"><span style="color:#999">아직 정산된 카드가 없습니다</span></div>' : ''}
+
 <script>
   let lane = 'text'
   function setLane(l) {
@@ -258,6 +293,32 @@ function kioskPage(pending: number, tcpTarget: string): string {
     document.getElementById('pending').textContent = r.pending
   }
   setInterval(refresh, 3000)
+
+  const HANDSEL = ${handselEnabled ? 'true' : 'false'}
+  const STAGE_KO = { posting: '잡 등록 중', posted: '에스크로 완료', claimed: '클레임', submitted: '제출 완료',
+                     settled: '정산 완료', 'claimed-elsewhere': '외부 워커 진행', failed: '실패' }
+  function chipClass(stage) {
+    if (stage === 'failed') return 'chip bad'
+    if (stage === 'claimed-elsewhere') return 'chip warn'
+    return 'chip done'
+  }
+  async function refreshHandsel() {
+    if (!HANDSEL) return
+    try {
+      const r = await fetch('/handsel/cards').then(r => r.json())
+      if (!r.cards || r.cards.length === 0) return
+      const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      document.getElementById('handsel').innerHTML = r.cards.map(({ card, entries }) => {
+        const last = entries[entries.length - 1]
+        const chips = entries.map(e => '<span class="' + chipClass(e.stage) + '">' + (STAGE_KO[e.stage] || e.stage) + '</span>').join('')
+        const detail = last && last.detail ? '<div class="hdetail">' + esc(last.detail) + '</div>' : ''
+        return '<div class="hcard"><div class="hlabel">' + esc(card.label) + ' <span style="color:#aaa;font-weight:normal">#' + esc(card.id) + '</span></div>'
+          + '<div class="chips">' + chips + '</div>' + detail + '</div>'
+      }).join('')
+    } catch { /* settlement view is decorative — never let it break the kiosk */ }
+  }
+  setInterval(refreshHandsel, 5000)
+  refreshHandsel()
 
   function readFile() {
     return new Promise((resolve, reject) => {
