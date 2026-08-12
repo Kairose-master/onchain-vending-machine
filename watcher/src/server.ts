@@ -332,6 +332,37 @@ export async function main() {
       return
     }
 
+    // Operator calibration: queue a servo motion with NO sale attached —
+    // stock and ledgers untouched. Localhost-only: on the booth LAN this
+    // would otherwise be a "make the machine spit things out" button.
+    if (req.method === 'POST' && req.url === '/slot-dispenses/test') {
+      const remote = req.socket.remoteAddress ?? ''
+      if (!/^(::1|127\.0\.0\.1|::ffff:127\.0\.0\.1)$/.test(remote)) {
+        res.writeHead(403)
+        res.end(JSON.stringify({ ok: false, error: 'test dispenses are localhost-only (run curl on the booth laptop)' }))
+        return
+      }
+      let body = ''
+      req.on('data', (c) => (body += c))
+      req.on('end', () => {
+        const slotId = Number(JSON.parse(body || '{}').slotId)
+        if (!Number.isInteger(slotId) || slotId < 1 || slotId > config.slotCount) {
+          res.writeHead(422)
+          res.end(JSON.stringify({ ok: false, error: `slotId must be 1–${config.slotCount}` }))
+          return
+        }
+        slotStore = {
+          ...slotStore,
+          pendingDispenses: [...slotStore.pendingDispenses, { slotId, txHash: `test-${Date.now()}`, from: 'operator-test' }],
+        }
+        saveSlots(slotStore)
+        console.log(`[slots] TEST dispense queued for slot ${slotId} (no sale, no stock change)`)
+        res.writeHead(200)
+        res.end(JSON.stringify({ ok: true, slotId, note: 'the board will fire this servo on its next poll' }))
+      })
+      return
+    }
+
     if (req.method === 'POST' && req.url === '/slot-dispenses/ack') {
       const [done, ...rest] = slotStore.pendingDispenses
       if (!done) {

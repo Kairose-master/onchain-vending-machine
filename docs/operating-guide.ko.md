@@ -88,7 +88,7 @@ IP는 재접속 때 바뀔 수 있다 — 접속 불량이면 IP부터 다시 �
 
 ## 3. 하드웨어 — 디스펜서 (슬롯용, 선택)
 
-`firmware/onchain_vending/onchain_vending.ino` + `docs/wiring.md`.
+`firmware/onchain_vending/onchain_vending.ino` + **제작 설명서 `docs/dispenser-build.ko.md`** (회로·골판지 조립·캘리브레이션 전체).
 슬롯당 서보 1개 (`SLOT_SERVO_PINS`, 기본 4채널: GPIO 18/19/21/22).
 스케치에 WiFi와 워처 주소 넣고 플래시. ESP32가 `/slot-dispenses`를 폴링해서
 어느 슬롯 서보를 돌릴지 받아가고, **실물 동작 후에** ack한다.

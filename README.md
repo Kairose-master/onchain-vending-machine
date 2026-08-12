@@ -35,6 +35,7 @@ buyer pays USDC ──> watcher (Node.js, polls Base Sepolia)
 | `watcher/` | The whole booth brain: chain watcher, kiosk web UI, plotter pipeline (fonts → strokes → G-code → GRBL over USB/WiFi), recipe market, slot market, machine-labor worker, Handsel settlement client, on-chain royalty payouts |
 | `firmware/onchain_vending/` | ESP32 sketch for the goods dispenser — polls `/slot-dispenses`, fires the right slot's servo, acks after the physical motion |
 | `docs/wiring.md` | Dispenser parts list, multi-servo pins, bring-up order |
+| `docs/dispenser-build.ko.md` | **디스펜서 제작 설명서 (Korean)** — 회로, 골판지 매거진+푸셔 조립, 치수 공식, 캘리브레이션 |
 | `docs/operating-guide.ko.md` | **운영자 매뉴얼 (Korean)** — 설치부터 행사 운영, 트러블슈팅까지 |
 
 ## Quick start (dry run — no hardware, no chain money needed)

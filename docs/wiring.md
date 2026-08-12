@@ -1,5 +1,8 @@
 # Wiring — the goods dispenser
 
+> 한국어 전체 제작 설명서 (회로 + 골판지 조립 + 캘리브레이션):
+> **`docs/dispenser-build.ko.md`**
+
 The dispenser board serves the **slot market**: each leased slot is one
 servo channel, and the watcher tells the board which slot to fire per
 sale. (The pen plotter is a separate board — a GRBL/ESP32 kit with its own
