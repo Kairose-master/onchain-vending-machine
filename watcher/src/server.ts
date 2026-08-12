@@ -609,7 +609,15 @@ function kioskPage(pending: number, tcpTarget: string, handselEnabled: boolean):
 </div>
 
 <div id="lane-image" class="lane">
-  <input type="file" id="file" accept="image/*">
+  <div class="row" style="margin-top:0">
+    <button onclick="startCamera()">📷 카메라로 찍기 (즉석 초상화)</button>
+  </div>
+  <div id="cameraBox" style="display:none;margin-top:.5rem">
+    <video id="camVideo" autoplay playsinline style="width:100%;transform:scaleX(-1);border:1px solid #ddd"></video>
+    <div class="row"><button onclick="captureSelfie()">찰칵</button><button onclick="stopCamera()">닫기</button></div>
+  </div>
+  <img id="capturedThumb" style="display:none;width:40%;margin-top:.5rem;border:1px solid #ddd" alt="captured">
+  <input type="file" id="file" accept="image/*" style="margin-top:.5rem">
   <div style="margin-top:.5rem">
     <label>선 추출 강도 <span id="thVal">160</span> (낮음=진한 선만 / 높음=흐린 부분까지)</label>
     <input type="range" id="threshold" min="40" max="240" value="160" style="width:100%"
@@ -683,6 +691,7 @@ ${handselEnabled ? '<h2 style="margin-top:1.5rem">Handsel 정산 <span style="fo
     }
     if (l === 'gallery') refreshRecipes()
     if (l === 'slots') refreshSlots()
+    if (l !== 'image') stopCamera()
   }
 
   async function refreshSlots() {
@@ -845,14 +854,56 @@ ${handselEnabled ? '<h2 style="margin-top:1.5rem">Handsel 정산 <span style="fo
       reader.readAsDataURL(f)
     })
   }
+
+  // Instant-portrait capture: the laptop webcam feeds the SAME image lane
+  // as an upload — trace, preview, plot. getUserMedia needs a secure
+  // context, so open the kiosk as http://localhost:8787 on the booth
+  // laptop (a LAN IP will refuse the camera; uploads still work there).
+  let camStream = null
+  let capturedImage = null
+  async function startCamera() {
+    try {
+      camStream = await navigator.mediaDevices.getUserMedia({ video: { width: 960, height: 720 } })
+      document.getElementById('camVideo').srcObject = camStream
+      document.getElementById('cameraBox').style.display = ''
+    } catch (e) {
+      alert('카메라를 열 수 없어요: ' + e.message + '\n(localhost로 접속했는지 확인 — LAN IP에서는 브라우저가 카메라를 막아요)')
+    }
+  }
+  function stopCamera() {
+    if (camStream) { camStream.getTracks().forEach(t => t.stop()); camStream = null }
+    document.getElementById('cameraBox').style.display = 'none'
+  }
+  function captureSelfie() {
+    const video = document.getElementById('camVideo')
+    const canvas = document.createElement('canvas')
+    canvas.width = video.videoWidth
+    canvas.height = video.videoHeight
+    const ctx = canvas.getContext('2d')
+    // Mirror the capture to match the mirrored preview — a selfie should
+    // come out the way the person saw themselves.
+    ctx.translate(canvas.width, 0)
+    ctx.scale(-1, 1)
+    ctx.drawImage(video, 0, 0)
+    capturedImage = canvas.toDataURL('image/jpeg', 0.9)
+    const thumb = document.getElementById('capturedThumb')
+    thumb.src = capturedImage
+    thumb.style.display = ''
+    document.getElementById('file').value = '' // the capture takes precedence; make that visible
+    // Portraits trace better a touch darker than line art.
+    document.getElementById('threshold').value = 130
+    document.getElementById('thVal').textContent = '130'
+    stopCamera()
+  }
   async function buildInput() {
     if (lane === 'text') return { text: document.getElementById('text').value }
     if (lane === 'gallery') {
       if (!selectedRecipe) throw new Error('갤러리에서 디자인을 먼저 선택하세요')
       return { recipeId: selectedRecipe }
     }
-    const imageBase64 = await readFile()
-    if (!imageBase64) throw new Error('이미지를 먼저 선택하세요')
+    const fileImage = await readFile()
+    const imageBase64 = fileImage || capturedImage // a fresh file pick outranks an old capture
+    if (!imageBase64) throw new Error('이미지를 선택하거나 카메라로 찍어주세요')
     return { imageBase64, threshold: Number(document.getElementById('threshold').value) }
   }
   async function preview() {
