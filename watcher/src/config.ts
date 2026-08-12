@@ -40,4 +40,10 @@ export const config = {
   // Author's share of each sale in bps. 7000 = author 70% / booth 30% —
   // the operator's cut covers paper, ink, the machine and the spot.
   recipeAuthorBps: Math.max(0, Math.min(10_000, Number(process.env.RECIPE_AUTHOR_BPS ?? 7000))),
+  // ---- slot market (the canonical operator market) ----
+  slotsFile: process.env.SLOTS_FILE?.trim() || './slots.json',
+  // Physical dispenser channels available on the machine (servos).
+  slotCount: Math.max(1, Math.min(16, Number(process.env.SLOT_COUNT ?? 4))),
+  // Lessee's share of each sale. 8000 = lessee 80% / machine 20%.
+  slotLesseeBps: Math.max(0, Math.min(10_000, Number(process.env.SLOT_LESSEE_BPS ?? 8000))),
 }

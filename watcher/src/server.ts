@@ -9,7 +9,17 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { config } from './config'
 import { makeClient, scanTransfers } from './chain-watch'
-import { createQueue, enqueueIfNew, dequeue, type QueueState } from './queue'
+import { createQueue, enqueueIfNew, dequeue, hasSeen, markSeen, type QueueState } from './queue'
+import {
+  emptySlotStore,
+  matchSlotByAmount,
+  recordSlotPayout,
+  recordSlotSale,
+  slotOutstanding,
+  validateLease,
+  type Slot,
+  type SlotStore,
+} from './slots'
 import { plot, plotInputToStrokes, plotterEnvFromProcess, type PlotInput } from './plotter/plot'
 import { polylinesToGcode } from './plotter/gcode'
 import { gcodeToSvg } from './plotter/svg-preview'
@@ -44,6 +54,20 @@ function saveState(state: Persisted) {
   writeFileSync(config.stateFile, JSON.stringify(state, null, 2))
 }
 
+function loadSlots(): SlotStore {
+  if (!existsSync(config.slotsFile)) return emptySlotStore()
+  try {
+    return JSON.parse(readFileSync(config.slotsFile, 'utf8'))
+  } catch {
+    console.error(`[slots] ${config.slotsFile} is unreadable — starting empty`)
+    return emptySlotStore()
+  }
+}
+
+function saveSlots(store: SlotStore) {
+  writeFileSync(config.slotsFile, JSON.stringify(store, null, 2))
+}
+
 function loadRecipes(): RecipeStore {
   if (!existsSync(config.recipesFile)) return emptyRecipeStore()
   try {
@@ -61,6 +85,58 @@ function saveRecipes(store: RecipeStore) {
 export async function main() {
   const client = makeClient()
   let state = loadState()
+  let slotStore = loadSlots()
+
+  /** A slot sale: stock down, revenue accrued, dispense queued for the
+   *  hardware, and (with the hot key) the lessee paid on-chain. */
+  function sellFromSlot(slot: Slot, txHash: string, fromAddr: string) {
+    const updated = recordSlotSale(slot, config.slotLesseeBps)
+    slotStore = {
+      ...slotStore,
+      slots: slotStore.slots.map((s) => (s.id === slot.id ? updated : s)),
+      pendingDispenses: [...slotStore.pendingDispenses, { slotId: slot.id, txHash, from: fromAddr }],
+    }
+    console.log(`[slots] sold "${updated.name}" (slot ${slot.id}) — ${updated.stock} left, paid by ${txHash}`)
+    void payLesseeOutstanding(slot.id)
+  }
+
+  async function payLesseeOutstanding(slotId: number) {
+    const slot = slotStore.slots.find((s) => s.id === slotId)
+    if (!slot || !slot.lesseeWallet || !isRoyaltyConfigured()) return
+    const amount = slotOutstanding(slot)
+    if (amount <= 0n) return
+    const paid = await payRoyalty(slot.lesseeWallet as `0x${string}`, amount)
+    if (paid.ok) {
+      const updated = recordSlotPayout(slotStore.slots.find((s) => s.id === slotId)!, amount, paid.txHash)
+      slotStore = { ...slotStore, slots: slotStore.slots.map((s) => (s.id === slotId ? updated : s)) }
+      saveSlots(slotStore)
+      console.log(`[slots] paid ${amount} base units to ${updated.lessee} — ${paid.txHash}`)
+    } else {
+      console.warn(`[slots] lessee payout deferred (accrued): ${paid.reason}`)
+    }
+  }
+
+  /** A payment hit a sold-out slot: money in, nothing to drop. Ledger it
+   *  and try to send it back — silently keeping it is theft. */
+  function refundSoldOut(slot: Slot, txHash: string, fromAddr: string, amount: string) {
+    slotStore = {
+      ...slotStore,
+      refundsDue: [...slotStore.refundsDue, { txHash, from: fromAddr, amountBaseUnits: amount, slotId: slot.id }],
+    }
+    console.warn(`[slots] "${slot.name}" (slot ${slot.id}) is SOLD OUT — payment ${txHash} owed back to ${fromAddr}`)
+    void (async () => {
+      if (!isRoyaltyConfigured()) return
+      const refunded = await payRoyalty(fromAddr as `0x${string}`, BigInt(amount))
+      if (refunded.ok) {
+        slotStore = {
+          ...slotStore,
+          refundsDue: slotStore.refundsDue.map((r) => (r.txHash === txHash ? { ...r, refundTx: refunded.txHash } : r)),
+        }
+        saveSlots(slotStore)
+        console.log(`[slots] refunded ${amount} to ${fromAddr} — ${refunded.txHash}`)
+      }
+    })()
+  }
 
   async function poll() {
     try {
@@ -76,11 +152,30 @@ export async function main() {
       const from = latest > window ? latest - window : 0n
       const payments = await scanTransfers(client, from, latest)
       let queue = state.queue
-      for (const p of payments) queue = enqueueIfNew(queue, p, config.priceBaseUnits)
+      let slotsTouched = false
+      for (const p of payments) {
+        if (hasSeen(queue, p.txHash)) continue
+        // Exact-amount slot match wins; everything else falls through to the
+        // card-credit lane. One shared dedup set, so a payment can never ride
+        // both lanes.
+        const slot = matchSlotByAmount(slotStore.slots, p.amountBaseUnits)
+        if (slot) {
+          queue = markSeen(queue, p.txHash)
+          if (slot.stock > 0) sellFromSlot(slot, p.txHash, p.from)
+          else refundSoldOut(slot, p.txHash, p.from, p.amountBaseUnits)
+          slotsTouched = true
+        } else {
+          queue = enqueueIfNew(queue, p, config.priceBaseUnits)
+        }
+      }
       state = { queue, lastScannedBlock: latest.toString() }
       saveState(state)
+      if (slotsTouched) saveSlots(slotStore)
       if (payments.length > 0) {
-        console.log(`[poll] block ${from}-${latest}: ${payments.length} transfer(s) seen, ${queue.pending.length} pending dispense`)
+        console.log(
+          `[poll] block ${from}-${latest}: ${payments.length} transfer(s) seen, ` +
+            `${queue.pending.length} card credit(s), ${slotStore.pendingDispenses.length} slot dispense(s) waiting`,
+        )
       }
     } catch (err) {
       // A dropped RPC call must never crash the watcher — the ESP32 keeps
@@ -148,6 +243,75 @@ export async function main() {
     if (req.method === 'GET' && req.url === '/handsel/cards') {
       res.writeHead(200)
       res.end(JSON.stringify({ enabled: handsel.enabled, cards: handsel.cards() }))
+      return
+    }
+
+    if (req.method === 'GET' && req.url === '/slots') {
+      res.writeHead(200)
+      res.end(
+        JSON.stringify({
+          slotCount: config.slotCount,
+          lesseeBps: config.slotLesseeBps,
+          payoutOn: isRoyaltyConfigured(),
+          vendingWallet: config.vendingWallet,
+          slots: slotStore.slots,
+          refundsDue: slotStore.refundsDue.filter((r) => !r.refundTx),
+        }),
+      )
+      return
+    }
+
+    if (req.method === 'POST' && req.url === '/slots') {
+      let body = ''
+      req.on('data', (c) => (body += c))
+      req.on('end', () => {
+        try {
+          const parsed = JSON.parse(body)
+          const checked = validateLease(parsed, {
+            existing: slotStore.slots,
+            maxSlots: config.slotCount,
+            cardPriceBaseUnits: config.priceBaseUnits,
+          })
+          if (!checked.ok) {
+            res.writeHead(422)
+            res.end(JSON.stringify({ ok: false, error: checked.error }))
+            return
+          }
+          const slot: Slot = { ...checked.slot, createdAt: new Date().toISOString() }
+          slotStore = { ...slotStore, slots: [...slotStore.slots, slot] }
+          saveSlots(slotStore)
+          console.log(`[slots] leased slot ${slot.id} to ${slot.lessee}: "${slot.name}" @ ${slot.priceBaseUnits} base units, stock ${slot.stock}`)
+          res.writeHead(200)
+          res.end(JSON.stringify({ ok: true, slot }))
+        } catch (err) {
+          res.writeHead(400)
+          res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : 'bad request' }))
+        }
+      })
+      return
+    }
+
+    // The dispenser firmware's queue: which servo to fire next. Ack AFTER
+    // the physical motion, same contract as the card lane.
+    if (req.method === 'GET' && req.url === '/slot-dispenses') {
+      const next = slotStore.pendingDispenses[0] ?? null
+      res.writeHead(200)
+      res.end(JSON.stringify({ pending: slotStore.pendingDispenses.length, next }))
+      return
+    }
+
+    if (req.method === 'POST' && req.url === '/slot-dispenses/ack') {
+      const [done, ...rest] = slotStore.pendingDispenses
+      if (!done) {
+        res.writeHead(409)
+        res.end(JSON.stringify({ ok: false, error: 'nothing to ack' }))
+        return
+      }
+      slotStore = { ...slotStore, pendingDispenses: rest }
+      saveSlots(slotStore)
+      console.log(`[slots] dispensed from slot ${done.slotId} (${done.txHash}) — ${rest.length} waiting`)
+      res.writeHead(200)
+      res.end(JSON.stringify({ ok: true, dispensed: done, remaining: rest.length }))
       return
     }
 
@@ -405,6 +569,7 @@ function kioskPage(pending: number, tcpTarget: string, handselEnabled: boolean):
   <button id="tab-text" class="active" onclick="setLane('text')">문구</button>
   <button id="tab-image" onclick="setLane('image')">이미지</button>
   <button id="tab-gallery" onclick="setLane('gallery')">갤러리</button>
+  <button id="tab-slots" onclick="setLane('slots')">슬롯</button>
 </div>
 
 <div id="lane-text" class="lane active">
@@ -439,6 +604,28 @@ function kioskPage(pending: number, tcpTarget: string, handselEnabled: boolean):
   </details>
 </div>
 
+<div id="lane-slots" class="lane">
+  <p style="font-size:.85rem;color:#666;margin:.25rem 0 .5rem">
+    실물 슬롯이에요. 운영자가 직접 상품을 채우고 가격을 정합니다 —
+    <b>지갑에서 슬롯의 정확한 금액을 보내면 기계가 자동으로 내보내요.</b>
+    판매액의 <span id="lesseePct">80</span>%가 운영자에게 갑니다.
+  </p>
+  <div id="slotList"><span style="color:#999">불러오는 중…</span></div>
+  <details style="margin-top:.75rem">
+    <summary style="cursor:pointer;font-size:.95rem">+ 슬롯 임대하기 (내 상품 팔기)</summary>
+    <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:.4rem">
+      <select id="sSlotId" style="font-size:1rem;padding:.4rem"></select>
+      <input id="sName" maxlength="40" placeholder="상품명 (예: 수제 스티커)" style="font-size:1rem;padding:.4rem">
+      <input id="sLessee" maxlength="20" placeholder="운영자명" style="font-size:1rem;padding:.4rem">
+      <input id="sWallet" placeholder="정산 받을 지갑 0x… (Base Sepolia, 비워도 됨)" style="font-size:1rem;padding:.4rem">
+      <input id="sPrice" type="number" step="0.000001" min="0.000001" placeholder="가격 (USDC — 다른 슬롯/카드와 달라야 함)" style="font-size:1rem;padding:.4rem">
+      <input id="sStock" type="number" min="1" max="999" placeholder="채워 넣을 재고 수량" style="font-size:1rem;padding:.4rem">
+      <button onclick="leaseSlot()" style="font-size:1rem;padding:.5rem;cursor:pointer">임대 등록</button>
+      <div id="sResult" style="font-size:.85rem"></div>
+    </div>
+  </details>
+</div>
+
 <div class="row">
   <button onclick="preview()">미리보기</button>
   <button id="go" onclick="plot()">그리기 시작</button>
@@ -454,11 +641,57 @@ ${handselEnabled ? '<h2 style="margin-top:1.5rem">Handsel 정산 <span style="fo
   let selectedRecipe = null
   function setLane(l) {
     lane = l
-    for (const t of ['text','image','gallery']) {
+    for (const t of ['text','image','gallery','slots']) {
       document.getElementById('tab-'+t).classList.toggle('active', t===l)
       document.getElementById('lane-'+t).classList.toggle('active', t===l)
     }
     if (l === 'gallery') refreshRecipes()
+    if (l === 'slots') refreshSlots()
+  }
+
+  async function refreshSlots() {
+    try {
+      const r = await fetch('/slots').then(r => r.json())
+      document.getElementById('lesseePct').textContent = (r.lesseeBps / 100).toString()
+      const list = document.getElementById('slotList')
+      const taken = new Set(r.slots.map(s => s.id))
+      const sel = document.getElementById('sSlotId')
+      sel.innerHTML = Array.from({length: r.slotCount}, (_, i) => i + 1)
+        .filter(i => !taken.has(i))
+        .map(i => '<option value="' + i + '">슬롯 ' + i + '</option>').join('') || '<option value="">빈 슬롯 없음</option>'
+      if (r.slots.length === 0) {
+        list.innerHTML = '<span style="color:#999">아직 임대된 슬롯이 없어요 — 1호 운영자가 되어보세요</span>'
+        return
+      }
+      list.innerHTML = r.slots.map(s =>
+        '<div class="hcard">' +
+          '<div class="hlabel">[' + s.id + '] ' + esc2(s.name) + ' <span style="color:#888;font-weight:normal">by ' + esc2(s.lessee) + '</span></div>' +
+          '<div style="font-size:.85rem">가격 <b>' + fmtUsdc(s.priceBaseUnits) + ' USDC</b> → <code style="font-size:.75rem">' + r.vendingWallet + '</code></div>' +
+          '<div style="font-size:.8rem;color:#666">재고 ' + s.stock + '개 · 판매 ' + s.sales + '회 · 운영자 수익 ' + fmtUsdc(s.accruedBaseUnits) + ' USDC' +
+          (s.lastPayoutTx ? ' <a href="https://sepolia.basescan.org/tx/' + s.lastPayoutTx + '" target="_blank">지급 tx↗</a>'
+            : Number(s.accruedBaseUnits) > 0 ? ' (적립)' : '') +
+          (s.stock === 0 ? ' · <b style="color:#c00">매진</b>' : '') +
+          '</div></div>'
+      ).join('')
+    } catch { /* optional decoration */ }
+  }
+  async function leaseSlot() {
+    const out = document.getElementById('sResult')
+    try {
+      const priceUsdc = Number(document.getElementById('sPrice').value)
+      const r = await fetch('/slots', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({
+        slotId: Number(document.getElementById('sSlotId').value),
+        name: document.getElementById('sName').value,
+        lessee: document.getElementById('sLessee').value,
+        lesseeWallet: document.getElementById('sWallet').value,
+        priceBaseUnits: String(Math.round(priceUsdc * 1e6)),
+        stock: Number(document.getElementById('sStock').value),
+      })})
+      const data = await r.json()
+      if (!data.ok) { out.innerHTML = '<span style="color:#c00">' + esc2(data.error) + '</span>'; return }
+      out.innerHTML = '<span style="color:#080">임대 완료! 이제 실물 재고를 슬롯에 채워주세요</span>'
+      refreshSlots()
+    } catch (e) { out.textContent = e.message }
   }
 
   const esc2 = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')

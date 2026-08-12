@@ -46,6 +46,17 @@ export function enqueueIfNew(
   }
 }
 
+/** Record a tx as handled WITHOUT crediting it — the slot lane consumed it
+ *  (sale or refund ledger). Shares the same dedup set as card credits so a
+ *  re-scan can never route one payment down both lanes. */
+export function markSeen(state: QueueState, txHash: string): QueueState {
+  if (state.seenTxHashes.includes(txHash)) return state
+  return { pending: state.pending, seenTxHashes: [...state.seenTxHashes, txHash] }
+}
+
+export const hasSeen = (state: QueueState, txHash: string): boolean =>
+  state.seenTxHashes.includes(txHash)
+
 export type DequeueResult = { state: QueueState; item: PendingPayment } | { state: QueueState; item: null }
 
 /** Pop the oldest pending payment — the ESP32 calls this once per successful
