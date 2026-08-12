@@ -24,6 +24,7 @@ import { plot, plotInputToStrokes, plotterEnvFromProcess, type PlotInput } from 
 import { polylinesToGcode } from './plotter/gcode'
 import { gcodeToSvg } from './plotter/svg-preview'
 import { initHandsel } from './handsel/settle'
+import { startMachineWorker, type MachineWorker } from './handsel/machine-worker'
 import type { Card } from './handsel/protocol'
 import { randomUUID } from 'node:crypto'
 import {
@@ -197,6 +198,31 @@ export async function main() {
   )
   let plotting = false
 
+  // The machine labor lane: external bounties carrying [machine:plot] get
+  // claimed and physically performed. Opt-in (MACHINE_WORKER=1) and only
+  // possible when the settlement lane registered a worker identity.
+  let machineWorker: MachineWorker | null = null
+  if (process.env.MACHINE_WORKER === '1') {
+    if (handsel.worker) {
+      machineWorker = startMachineWorker({
+        env: handsel.worker.env,
+        auth: handsel.worker.auth,
+        plotterEnv,
+        machineName: process.env.MACHINE_NAME?.trim() || 'vending-booth-plotter',
+        tryLockPlotter: () => {
+          if (plotting) return false
+          plotting = true
+          return true
+        },
+        releasePlotter: () => {
+          plotting = false
+        },
+      })
+    } else {
+      console.warn('[machine-work] MACHINE_WORKER=1 but the Handsel worker identity is not configured — lane stays OFF')
+    }
+  }
+
   const findRecipe = (id: unknown): Recipe | undefined =>
     typeof id === 'string' ? recipeStore.recipes.find((r) => r.id === id) : undefined
 
@@ -243,6 +269,12 @@ export async function main() {
     if (req.method === 'GET' && req.url === '/handsel/cards') {
       res.writeHead(200)
       res.end(JSON.stringify({ enabled: handsel.enabled, cards: handsel.cards() }))
+      return
+    }
+
+    if (req.method === 'GET' && req.url === '/machine-work') {
+      res.writeHead(200)
+      res.end(JSON.stringify({ enabled: machineWorker !== null, work: machineWorker?.records() ?? [] }))
       return
     }
 
@@ -635,6 +667,10 @@ function kioskPage(pending: number, tcpTarget: string, handselEnabled: boolean):
 <div id="result"></div>
 
 ${handselEnabled ? '<h2 style="margin-top:1.5rem">Handsel 정산 <span style="font-size:.8rem;color:#888;font-weight:normal">카드 1장 = 라이브 잡 1건</span></h2><div id="handsel"><span style="color:#999">아직 정산된 카드가 없습니다</span></div>' : ''}
+<div id="machineWorkSection" style="display:none">
+  <h2 style="margin-top:1.5rem">기계 노동 <span style="font-size:.8rem;color:#888;font-weight:normal">외부 바운티를 이 기계가 수행</span></h2>
+  <div id="machineWork"></div>
+</div>
 
 <script>
   let lane = 'text'
@@ -781,6 +817,23 @@ ${handselEnabled ? '<h2 style="margin-top:1.5rem">Handsel 정산 <span style="fo
   }
   setInterval(refreshHandsel, 5000)
   refreshHandsel()
+
+  const MW_KO = { claimed: '클레임', plotted: '실물 플롯', submitted: '제출 완료', failed: '실패' }
+  async function refreshMachineWork() {
+    try {
+      const r = await fetch('/machine-work').then(r => r.json())
+      if (!r.enabled || r.work.length === 0) return
+      document.getElementById('machineWorkSection').style.display = ''
+      const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      document.getElementById('machineWork').innerHTML = r.work.map(w =>
+        '<div class="hcard"><div class="hlabel">잡 #' + w.jobId + ' <span style="color:#888;font-weight:normal">' + esc(w.plottedText) + '</span></div>' +
+        '<div class="chips">' + w.entries.map(e => '<span class="' + (e.stage === 'failed' ? 'chip bad' : 'chip done') + '">' + (MW_KO[e.stage] || e.stage) + '</span>').join('') + '</div>' +
+        (w.entries.length && w.entries[w.entries.length-1].detail ? '<div class="hdetail">' + esc(w.entries[w.entries.length-1].detail) + '</div>' : '') +
+        '</div>').join('')
+    } catch { /* decorative */ }
+  }
+  setInterval(refreshMachineWork, 7000)
+  refreshMachineWork()
 
   function readFile() {
     return new Promise((resolve, reject) => {

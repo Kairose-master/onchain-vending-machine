@@ -107,6 +107,75 @@ export function buildSubmissionOutput(card: Card, plottedAtIso: string): string 
   ].join('\n')
 }
 
+// ── the machine labor lane (operatorship archetype #3) ────────────────────
+// External demand posts a job carrying the machine marker; this machine
+// discovers it in the public feed, claims it by id, performs it physically,
+// and submits the production record. The DEMAND side is a stranger — that
+// is the whole difference from the card-settlement lane above, where the
+// booth is its own requester.
+
+/** Jobs addressed to plot-capable machines carry this in the title. */
+export const MACHINE_PLOT_MARKER = '[machine:plot]'
+
+/**
+ * Is this feed entry a bounty this machine should claim? Own booth-card
+ * jobs are excluded by their `[booth:` marker — a machine must never
+ * "discover" the jobs it posted about its own output.
+ */
+export function isMachineBounty(title: string, marker: string = MACHINE_PLOT_MARKER): boolean {
+  return title.includes(marker) && !title.includes('[booth:')
+}
+
+/**
+ * What to physically plot, parsed from the job's text fields BEFORE
+ * claiming — a job this machine cannot parse must be left unclaimed for
+ * someone who can, not claimed and failed. Convention (documented in the
+ * README): a line `plot: <the text>` in the description or criteria;
+ * quotes optional. Falls back to the title minus the marker.
+ */
+export function extractPlotText(fields: { title: string; description?: string | null; acceptanceCriteria?: string | null }): string | null {
+  for (const source of [fields.description, fields.acceptanceCriteria]) {
+    const m = source?.match(/plot:\s*"([^"]{1,80})"|plot:\s*([^\n]{1,80})/)
+    if (m) {
+      const text = (m[1] ?? m[2] ?? '').trim()
+      if (text) return text
+    }
+  }
+  const fallback = fields.title.replace(MACHINE_PLOT_MARKER, '').trim()
+  return fallback.length > 0 && fallback.length <= 80 ? fallback : null
+}
+
+/** The machine's deliverable: what it plotted and the physical evidence it
+ *  can honestly offer (production statistics — this machine has no camera,
+ *  and the record says so instead of pretending). */
+export function buildMachineSubmission(input: {
+  jobTitle: string
+  plottedText: string
+  stats: CardStats
+  machineName: string
+  plottedAtIso: string
+}): string {
+  return [
+    `Machine execution record — ${input.machineName}`,
+    `Bounty: ${input.jobTitle}`,
+    `Physically plotted text: ${input.plottedText}`,
+    `Plot statistics: ${input.stats.polylines} polylines, ${input.stats.points} points, ` +
+      `${input.stats.drawLengthMm.toFixed(0)} mm drawn, ~${input.stats.estMinutes.toFixed(1)} min`,
+    `Plotted at: ${input.plottedAtIso}`,
+    `Evidence class: production record (no camera on this machine — stats and G-code, not photographs)`,
+  ].join('\n')
+}
+
+export type MachineWorkStage = 'claimed' | 'plotted' | 'submitted' | 'failed'
+
+export interface MachineWorkRecord {
+  jobId: number
+  taskId: string | null
+  title: string
+  plottedText: string
+  entries: Array<{ stage: MachineWorkStage; at: string; detail?: string }>
+}
+
 /**
  * Timeline vocabulary the kiosk renders. 'claimed-elsewhere' is a real,
  * honest state: the job is on a PUBLIC market, and another worker beating

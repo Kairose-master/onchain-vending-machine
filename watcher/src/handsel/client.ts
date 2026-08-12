@@ -115,6 +115,19 @@ export async function fetchTasks(env: HandselEnv, status: 'Open' | 'all'): Promi
   return Array.isArray(data?.tasks) ? data.tasks : []
 }
 
+/** The feed's fuller shape, for lanes that need to READ a job before
+ *  deciding to claim it (the machine labor lane parses the plot text from
+ *  these fields — an unparseable job is left for someone who can). */
+export interface FeedTaskDetail extends FeedTask {
+  description?: string | null
+  acceptanceCriteria?: string | null
+  chain?: string
+}
+
+export async function fetchTaskDetails(env: HandselEnv, status: 'Open' | 'all'): Promise<FeedTaskDetail[]> {
+  return (await fetchTasks(env, status)) as FeedTaskDetail[]
+}
+
 export type ClaimResult = { ok: true; taskId: string } | { ok: false; reason: string }
 
 export async function claimJob(env: HandselEnv, auth: WorkerAuth, jobId: number): Promise<ClaimResult> {

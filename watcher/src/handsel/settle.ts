@@ -46,6 +46,9 @@ export interface HandselService {
   enabled: boolean
   settleCard(card: Card): void
   cards(): CardTimeline[]
+  /** The registered worker identity, shared with the machine-labor lane —
+   *  re-registering there would rotate the secret out from under this one. */
+  worker: { env: HandselEnv; auth: WorkerAuth } | null
 }
 
 const disabledService: HandselService = {
@@ -54,6 +57,7 @@ const disabledService: HandselService = {
     /* booth runs standalone — nothing to do */
   },
   cards: () => [],
+  worker: null,
 }
 
 export async function initHandsel(processEnv: NodeJS.ProcessEnv): Promise<HandselService> {
@@ -161,5 +165,6 @@ export async function initHandsel(processEnv: NodeJS.ProcessEnv): Promise<Handse
       })
     },
     cards: () => [...timelines.values()].reverse(), // newest first for the kiosk
+    worker: { env, auth },
   }
 }
