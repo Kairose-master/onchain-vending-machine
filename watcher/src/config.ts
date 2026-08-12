@@ -35,4 +35,9 @@ export const config = {
   // seenTxHashes dedup is what makes re-scanning safe.
   scanWindowBlocks: Number(process.env.SCAN_WINDOW_BLOCKS ?? 500),
   stateFile: process.env.STATE_FILE?.trim() || './state.json',
+  // ---- recipe market (docs: handsel docs/physical-operatorship.md, inc. 1) ----
+  recipesFile: process.env.RECIPES_FILE?.trim() || './recipes.json',
+  // Author's share of each sale in bps. 7000 = author 70% / booth 30% —
+  // the operator's cut covers paper, ink, the machine and the spot.
+  recipeAuthorBps: Math.max(0, Math.min(10_000, Number(process.env.RECIPE_AUTHOR_BPS ?? 7000))),
 }
