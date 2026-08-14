@@ -38,6 +38,23 @@ import {
   type RecipeStore,
 } from './recipes'
 import { isRoyaltyConfigured, payRoyalty } from './royalty'
+import {
+  concessionFromMachineBounty,
+  concessionFromRecipe,
+  concessionFromSlot,
+  classifyOperatorship,
+  describeConcession,
+} from './concession'
+import {
+  creditScore,
+  payableBaseUnits,
+  rollingBondBaseUnits,
+  summarize,
+  underwrite,
+  type OperatorEvent,
+} from './operator-credit'
+import { buildRestockBounty, detectRestockNeeds, hasOpenRestockBounty, upgradeRestockEvidence } from './restock'
+import { fetchTasks, makePaidFetch, postExternalJob } from './handsel/client'
 
 type Persisted = { queue: QueueState; lastScannedBlock: string }
 
@@ -83,10 +100,40 @@ function saveRecipes(store: RecipeStore) {
   writeFileSync(config.recipesFile, JSON.stringify(store, null, 2))
 }
 
+/** The credit ledger. Never back-filled: an operator's history begins the
+ *  first time this file records something they did (operator-credit.ts). */
+function loadOperatorEvents(): OperatorEvent[] {
+  if (!existsSync(config.operatorEventsFile)) return []
+  try {
+    const parsed = JSON.parse(readFileSync(config.operatorEventsFile, 'utf8'))
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    console.error(`[credit] ${config.operatorEventsFile} is unreadable — starting an empty ledger`)
+    return []
+  }
+}
+
+function saveOperatorEvents(events: OperatorEvent[]) {
+  writeFileSync(config.operatorEventsFile, JSON.stringify(events, null, 2))
+}
+
 export async function main() {
   const client = makeClient()
   let state = loadState()
   let slotStore = loadSlots()
+
+  let operatorEvents = loadOperatorEvents()
+
+  function recordOperatorEvent(e: OperatorEvent) {
+    operatorEvents = [...operatorEvents, e]
+    saveOperatorEvents(operatorEvents)
+  }
+
+  /** This operator's score right now, from the ledger alone. */
+  function scoreOf(operator: string): number {
+    const rec = summarize(operatorEvents).find((r) => r.operator === operator)
+    return rec ? creditScore(rec, new Date().toISOString()).score : 0
+  }
 
   /** A slot sale: stock down, revenue accrued, dispense queued for the
    *  hardware, and (with the hot key) the lessee paid on-chain. */
@@ -98,20 +145,57 @@ export async function main() {
       pendingDispenses: [...slotStore.pendingDispenses, { slotId: slot.id, txHash, from: fromAddr }],
     }
     console.log(`[slots] sold "${updated.name}" (slot ${slot.id}) — ${updated.stock} left, paid by ${txHash}`)
+
+    const concessionId = `slot:${slot.id}`
+    // The free evidence upgrade: this slot just sold, so it had stock, so the
+    // last CLAIMED restock of it really happened. No sensor involved — the
+    // machine doing its ordinary job is the attestation (restock.ts).
+    operatorEvents = upgradeRestockEvidence(operatorEvents, concessionId)
+    recordOperatorEvent({
+      kind: 'sale',
+      at: new Date().toISOString(),
+      concessionId,
+      operator: slot.lessee,
+    })
     void payLesseeOutstanding(slot.id)
   }
 
+  /**
+   * Pay the lessee what is owed MINUS their rolling performance bond.
+   *
+   * The bond is the enforced half of operator credit: an unrated operator has
+   * 30% of earnings held, a proven one 5%, and the difference is released
+   * automatically as the score rises. Held, not taken — `/operators` reports
+   * it as owed, because a hold nobody can see is indistinguishable from a
+   * shortfall.
+   */
   async function payLesseeOutstanding(slotId: number) {
     const slot = slotStore.slots.find((s) => s.id === slotId)
     if (!slot || !slot.lesseeWallet || !isRoyaltyConfigured()) return
-    const amount = slotOutstanding(slot)
-    if (amount <= 0n) return
+    const owed = slotOutstanding(slot)
+    if (owed <= 0n) return
+
+    const score = scoreOf(slot.lessee)
+    const amount = payableBaseUnits({
+      lifetimeAccruedBaseUnits: BigInt(slot.accruedBaseUnits),
+      outstandingBaseUnits: owed,
+      score,
+    })
+    if (amount <= 0n) {
+      console.log(`[credit] ${slot.lessee}: ${owed} base units held as performance bond (score ${score}) — nothing payable yet`)
+      return
+    }
+
     const paid = await payRoyalty(slot.lesseeWallet as `0x${string}`, amount)
     if (paid.ok) {
       const updated = recordSlotPayout(slotStore.slots.find((s) => s.id === slotId)!, amount, paid.txHash)
       slotStore = { ...slotStore, slots: slotStore.slots.map((s) => (s.id === slotId ? updated : s)) }
       saveSlots(slotStore)
-      console.log(`[slots] paid ${amount} base units to ${updated.lessee} — ${paid.txHash}`)
+      const held = owed - amount
+      console.log(
+        `[slots] paid ${amount} base units to ${updated.lessee} — ${paid.txHash}` +
+          (held > 0n ? ` (${held} held as bond, score ${score})` : ''),
+      )
     } else {
       console.warn(`[slots] lessee payout deferred (accrued): ${paid.reason}`)
     }
@@ -125,6 +209,14 @@ export async function main() {
       refundsDue: [...slotStore.refundsDue, { txHash, from: fromAddr, amountBaseUnits: amount, slotId: slot.id }],
     }
     console.warn(`[slots] "${slot.name}" (slot ${slot.id}) is SOLD OUT — payment ${txHash} owed back to ${fromAddr}`)
+    // A stockout is not bad luck, it is the operator's job undone — and it is
+    // the single strongest negative signal in their credit record.
+    recordOperatorEvent({
+      kind: 'stockout',
+      at: new Date().toISOString(),
+      concessionId: `slot:${slot.id}`,
+      operator: slot.lessee,
+    })
     void (async () => {
       if (!isRoyaltyConfigured()) return
       const refunded = await payRoyalty(fromAddr as `0x${string}`, BigInt(amount))
@@ -191,12 +283,21 @@ export async function main() {
   const plotterEnv = plotterEnvFromProcess(process.env)
   const handsel = await initHandsel(process.env)
   let recipeStore = loadRecipes()
+  const bootedAt = new Date().toISOString()
   const royaltyOn = isRoyaltyConfigured()
   console.log(
     `[recipes] ${recipeStore.recipes.length} design(s), author share ${config.recipeAuthorBps / 100}%, ` +
       `royalty payout ${royaltyOn ? 'ON (on-chain USDC per sale)' : 'OFF (accrue only — set ROYALTY_PAYER_KEY)'}`,
   )
   let plotting = false
+
+  console.log(
+    `[credit] ${operatorEvents.length} ledger event(s), ${summarize(operatorEvents).length} operator(s) — ` +
+      'a rolling bond is withheld from payouts and released as the record fills in',
+  )
+  console.log(
+    `[restock] ${config.machineLocation ? `location "${config.machineLocation}" — the machine can hire` : 'MACHINE_LOCATION unset — the machine cannot post physical jobs'}`,
+  )
 
   // The machine labor lane: external bounties carrying [machine:plot] get
   // claimed and physically performed. Opt-in (MACHINE_WORKER=1) and only
@@ -312,9 +413,20 @@ export async function main() {
           const slot: Slot = { ...checked.slot, createdAt: new Date().toISOString() }
           slotStore = { ...slotStore, slots: [...slotStore.slots, slot] }
           saveSlots(slotStore)
+          recordOperatorEvent({
+            kind: 'lease-start',
+            at: slot.createdAt,
+            concessionId: `slot:${slot.id}`,
+            operator: slot.lessee,
+          })
+          const rec = summarize(operatorEvents).find((r) => r.operator === slot.lessee)
+          const credit = rec ? underwrite(rec, new Date().toISOString()) : null
           console.log(`[slots] leased slot ${slot.id} to ${slot.lessee}: "${slot.name}" @ ${slot.priceBaseUnits} base units, stock ${slot.stock}`)
           res.writeHead(200)
-          res.end(JSON.stringify({ ok: true, slot }))
+          // The credit terms travel with the lease response so the operator
+          // learns what is held from their earnings BEFORE they stock the
+          // magazine, not when a payout comes up short.
+          res.end(JSON.stringify({ ok: true, slot, credit }))
         } catch (err) {
           res.writeHead(400)
           res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : 'bad request' }))
@@ -359,6 +471,189 @@ export async function main() {
         console.log(`[slots] TEST dispense queued for slot ${slotId} (no sale, no stock change)`)
         res.writeHead(200)
         res.end(JSON.stringify({ ok: true, slotId, note: 'the board will fire this servo on its next poll' }))
+      })
+      return
+    }
+
+    /** All three lanes in one vocabulary, each with the taxonomy's own
+     *  verdict on itself — including the two that are honestly NOT
+     *  operatorship (concession.ts). */
+    if (req.method === 'GET' && req.url === '/concessions') {
+      const machineName = config.machineName
+      const items = [
+        ...slotStore.slots.map((s) => concessionFromSlot(s, { machineName, lesseeBps: config.slotLesseeBps })),
+        ...recipeStore.recipes.map((r) =>
+          concessionFromRecipe(r, { machineName, authorBps: config.recipeAuthorBps }),
+        ),
+        ...(machineWorker
+          ? [
+              concessionFromMachineBounty({
+                machineName,
+                ownerName: 'machine owner',
+                jobsDone: machineWorker.records().filter((r) => r.entries.some((e) => e.stage === 'submitted')).length,
+                since: bootedAt,
+              }),
+            ]
+          : []),
+      ]
+      res.writeHead(200)
+      res.end(
+        JSON.stringify({
+          concessions: items.map((c) => ({
+            ...c,
+            classification: classifyOperatorship(c.conditions),
+            line: describeConcession(c),
+          })),
+        }),
+      )
+      return
+    }
+
+    /** Operator credit: the score, the reasons, and exactly how much of their
+     *  money is being held right now. */
+    if (req.method === 'GET' && req.url === '/operators') {
+      const now = new Date().toISOString()
+      const records = summarize(operatorEvents)
+      res.writeHead(200)
+      res.end(
+        JSON.stringify({
+          ledgerEvents: operatorEvents.length,
+          operators: records.map((rec) => {
+            const u = underwrite(rec, now)
+            // What is actually held, across every slot this operator runs.
+            const held = slotStore.slots
+              .filter((s) => s.lessee === rec.operator)
+              .reduce(
+                (sum, s) =>
+                  sum +
+                  rollingBondBaseUnits({
+                    lifetimeAccruedBaseUnits: BigInt(s.accruedBaseUnits),
+                    outstandingBaseUnits: slotOutstanding(s),
+                    score: u.score,
+                  }),
+                0n,
+              )
+            return { ...u, record: rec, bondHeldBaseUnits: held.toString() }
+          }),
+        }),
+      )
+      return
+    }
+
+    /** What needs hands, and what the operators' own accruals can pay for it. */
+    if (req.method === 'GET' && req.url === '/restock-needs') {
+      const needs = detectRestockNeeds(slotStore.slots, operatorEvents)
+      res.writeHead(200)
+      res.end(
+        JSON.stringify({
+          location: config.machineLocation || null,
+          canPost: Boolean(config.machineLocation) && Boolean(handsel.worker),
+          needs: needs.map((n) => ({
+            ...n,
+            job: config.machineLocation
+              ? buildRestockBounty(n, { machineName: config.machineName, location: config.machineLocation })
+              : null,
+          })),
+        }),
+      )
+      return
+    }
+
+    /**
+     * The machine hires. Posts the most urgent fundable restock need to the
+     * market as a real escrowed job.
+     *
+     * Explicitly triggered, not on a timer: this spends the posting fee and
+     * creates a public escrow, and a detector bug on a loop would do both
+     * repeatedly. Deduped against the live feed as well, because "the operator
+     * pressed the button twice" is at least as likely as a bug.
+     */
+    if (req.method === 'POST' && req.url === '/restock-needs/post') {
+      void (async () => {
+        try {
+          if (!config.machineLocation) {
+            res.writeHead(409)
+            res.end(JSON.stringify({ ok: false, error: 'MACHINE_LOCATION is unset — a physical job that cannot say where it is wastes a claim' }))
+            return
+          }
+          if (!handsel.worker) {
+            res.writeHead(409)
+            res.end(JSON.stringify({ ok: false, error: 'Handsel is not configured — no market to hire in' }))
+            return
+          }
+          const need = detectRestockNeeds(slotStore.slots, operatorEvents).find((n) => n.fundable)
+          if (!need) {
+            res.writeHead(409)
+            res.end(JSON.stringify({ ok: false, error: 'nothing fundable to post', needs: detectRestockNeeds(slotStore.slots, operatorEvents) }))
+            return
+          }
+          const open = await fetchTasks(handsel.worker.env, 'Open')
+          if (hasOpenRestockBounty(open.map((t) => t.title), need.slotId)) {
+            res.writeHead(409)
+            res.end(JSON.stringify({ ok: false, error: `slot ${need.slotId} already has an open restock bounty` }))
+            return
+          }
+          const job = buildRestockBounty(need, { machineName: config.machineName, location: config.machineLocation })
+          const paidFetch = await makePaidFetch(handsel.worker.env.payerKey)
+          const posted = await postExternalJob(handsel.worker.env, paidFetch, job)
+          console.log(`[restock] posted a bounty for slot ${need.slotId} — ${posted.pending ? 'escrow confirming' : posted.escrowTx}`)
+          res.writeHead(200)
+          res.end(JSON.stringify({ ok: true, need, job, posted }))
+        } catch (err) {
+          res.writeHead(502)
+          res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : 'post failed' }))
+        }
+      })()
+      return
+    }
+
+    /** A restock landed: register the new count. Records a SELF-REPORTED
+     *  restock, which the next paid dispense from that slot upgrades to
+     *  confirmed-by-sale on its own. */
+    if (req.method === 'POST' && req.url === '/slots/restock') {
+      let body = ''
+      req.on('data', (c) => (body += c))
+      req.on('end', () => {
+        try {
+          const parsed = JSON.parse(body || '{}')
+          const slotId = Number(parsed.slotId)
+          const added = Number(parsed.added)
+          const slot = slotStore.slots.find((s) => s.id === slotId)
+          if (!slot) {
+            res.writeHead(404)
+            res.end(JSON.stringify({ ok: false, error: `slot ${slotId} is not leased` }))
+            return
+          }
+          if (!Number.isInteger(added) || added < 1 || added > 999) {
+            res.writeHead(422)
+            res.end(JSON.stringify({ ok: false, error: '추가 수량은 1~999개' }))
+            return
+          }
+          const updated = { ...slot, stock: slot.stock + added }
+          slotStore = { ...slotStore, slots: slotStore.slots.map((s) => (s.id === slotId ? updated : s)) }
+          saveSlots(slotStore)
+          recordOperatorEvent({
+            kind: 'restock',
+            at: new Date().toISOString(),
+            concessionId: `slot:${slotId}`,
+            operator: slot.lessee,
+            units: added,
+            evidence: 'self-reported',
+          })
+          console.log(`[slots] slot ${slotId} restocked +${added} → ${updated.stock} (self-reported; a sale will confirm it)`)
+          res.writeHead(200)
+          res.end(
+            JSON.stringify({
+              ok: true,
+              slot: updated,
+              evidence: 'self-reported',
+              note: 'the next paid dispense from this slot upgrades this to confirmed-by-sale',
+            }),
+          )
+        } catch (err) {
+          res.writeHead(400)
+          res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : 'bad request' }))
+        }
       })
       return
     }
@@ -711,6 +1006,18 @@ ${handselEnabled ? '<h2 style="margin-top:1.5rem">Handsel 정산 <span style="fo
   <div id="machineWork"></div>
 </div>
 
+<h2 style="margin-top:1.5rem">운영자 신용 <span style="font-size:.8rem;color:#888;font-weight:normal">기록으로 담보를 대신합니다</span></h2>
+<div id="operators"><span style="color:#999">아직 신용 기록이 없습니다 — 첫 판매부터 쌓입니다</span></div>
+
+<h2 style="margin-top:1.5rem">재입고 <span style="font-size:.8rem;color:#888;font-weight:normal">비면 기계가 사람을 고용합니다</span></h2>
+<div class="row">
+  <select id="rSlotId"></select>
+  <input id="rAdded" type="number" min="1" max="999" value="5" style="width:6rem" />
+  <button onclick="doRestock()">재입고 등록</button>
+</div>
+<div id="restockNeeds"></div>
+<div id="rResult"></div>
+
 <script>
   let lane = 'text'
   let selectedRecipe = null
@@ -874,6 +1181,77 @@ ${handselEnabled ? '<h2 style="margin-top:1.5rem">Handsel 정산 <span style="fo
   }
   setInterval(refreshMachineWork, 7000)
   refreshMachineWork()
+
+  const RATING_KO = { unrated: '미평가', thin: '얇음', fair: '보통', good: '양호', strong: '우수' }
+  async function refreshOperators() {
+    try {
+      const r = await fetch('/operators').then(r => r.json())
+      const box = document.getElementById('operators')
+      if (r.operators.length === 0) return
+      box.innerHTML = r.operators.map(o =>
+        '<div class="hcard">' +
+          '<div class="hlabel">' + esc2(o.operator) + ' — ' + o.score + '점 <span style="color:#888;font-weight:normal">' +
+          (RATING_KO[o.rating] || o.rating) + ' · 기록 ' + o.meteredEvents + '건</span></div>' +
+          '<div style="font-size:.8rem;color:#666">보증금 유보 ' + fmtUsdc(o.bondHeldBaseUnits) + ' USDC ' +
+          '<span style="color:#999">(점수가 오르면 자동 지급)</span></div>' +
+          '<div class="hdetail">' + o.basis.map(b => esc2(b)).join('<br>') + '</div>' +
+        '</div>').join('')
+    } catch { /* decorative */ }
+  }
+
+  const URGENCY_KO = { 'empty-with-demand': '매진 — 손님을 돌려보내는 중', empty: '매진', low: '재고 적음' }
+  async function refreshRestock() {
+    try {
+      const r = await fetch('/restock-needs').then(r => r.json())
+      const sel = document.getElementById('rSlotId')
+      const slots = await fetch('/slots').then(r => r.json())
+      sel.innerHTML = slots.slots.map(s => '<option value="' + s.id + '">슬롯 ' + s.id + ' · ' + esc2(s.name) + '</option>').join('')
+        || '<option value="">임대된 슬롯 없음</option>'
+      const box = document.getElementById('restockNeeds')
+      if (r.needs.length === 0) { box.innerHTML = '<span style="color:#999">모든 슬롯 재고 충분</span>'; return }
+      box.innerHTML = r.needs.map(n =>
+        '<div class="hcard">' +
+          '<div class="hlabel">슬롯 ' + n.slotId + ' · ' + esc2(n.name) + ' <span style="color:#c00;font-weight:normal">' +
+          (URGENCY_KO[n.urgency] || n.urgency) + '</span></div>' +
+          '<div style="font-size:.8rem;color:#666">재고 ' + n.stock + '개' +
+          (n.openStockouts > 0 ? ' · 놓친 결제 ' + n.openStockouts + '건' : '') +
+          (n.fundable
+            ? ' · 바운티 ' + fmtUsdc(n.bountyBaseUnits) + ' USDC (' + esc2(n.operator) + ' 수익에서)'
+            : ' · <span style="color:#999">바운티 불가: ' + esc2(n.reason || '') + '</span>') +
+          '</div>' +
+          (n.fundable && r.canPost
+            ? '<div class="row"><button onclick="postRestockBounty()">이 일감 시장에 올리기</button></div>'
+            : '') +
+        '</div>').join('')
+    } catch { /* decorative */ }
+  }
+
+  async function doRestock() {
+    const out = document.getElementById('rResult')
+    try {
+      const r = await fetch('/slots/restock', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({
+        slotId: Number(document.getElementById('rSlotId').value),
+        added: Number(document.getElementById('rAdded').value),
+      })}).then(r => r.json())
+      out.textContent = r.ok
+        ? '재입고 등록 — 재고 ' + r.slot.stock + '개 (자기보고; 다음 판매가 확인해 줍니다)'
+        : '실패: ' + r.error
+      refreshRestock(); refreshSlots(); refreshOperators()
+    } catch (e) { out.textContent = '실패: ' + e.message }
+  }
+
+  async function postRestockBounty() {
+    const out = document.getElementById('rResult')
+    out.textContent = '시장에 올리는 중…'
+    try {
+      const r = await fetch('/restock-needs/post', { method:'POST' }).then(r => r.json())
+      out.textContent = r.ok ? '일감 게시 완료 — 슬롯 ' + r.need.slotId : '실패: ' + r.error
+      refreshRestock()
+    } catch (e) { out.textContent = '실패: ' + e.message }
+  }
+
+  setInterval(() => { refreshOperators(); refreshRestock() }, 9000)
+  refreshOperators(); refreshRestock()
 
   function readFile() {
     return new Promise((resolve, reject) => {

@@ -46,4 +46,12 @@ export const config = {
   slotCount: Math.max(1, Math.min(16, Number(process.env.SLOT_COUNT ?? 4))),
   // Lessee's share of each sale. 8000 = lessee 80% / machine 20%.
   slotLesseeBps: Math.max(0, Math.min(10_000, Number(process.env.SLOT_LESSEE_BPS ?? 8000))),
+  // ---- operator credit + the restock lane ----
+  // The credit ledger. Append-only in practice: it is the only record of WHEN
+  // things happened, and the score is derived from nothing else.
+  operatorEventsFile: process.env.OPERATOR_EVENTS_FILE?.trim() || './operator-events.json',
+  machineName: process.env.MACHINE_NAME?.trim() || 'onchain vending booth',
+  // Where a restocker has to physically go. Empty = the restock lane stays
+  // off: a physical job that cannot say where it is wastes a claim.
+  machineLocation: process.env.MACHINE_LOCATION?.trim() || '',
 }
