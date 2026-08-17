@@ -117,9 +117,11 @@ for (const p of pieces) {
   const y = oy + 12
   rect(cx, y, p.w, p.h, { fill: P_.fill })
   if (p.n.startsWith('BACK')) {
-    // the arm's doorway
-    rect(cx + (p.w - 30) / 2, y + p.h - 14, 30, 12, { fill: '#fff', dash: '4 3' })
-    txt(cx + p.w / 2, y + p.h - 17, 'arm slot 30x12', { anchor: 'middle', size: 8, fill: P_.thin })
+    // The arm's doorway, FLUSH with the bottom edge. Leaving even 2mm of
+    // material below it puts cardboard in the path of the arm, which sits at
+    // 0..T because it has to contact the full face of the bottom item.
+    rect(cx + (p.w - 30) / 2, y + p.h - 12, 30, 12, { fill: '#fff', dash: '4 3' })
+    txt(cx + p.w / 2, y + p.h - 15, 'arm slot 30x12, flush', { anchor: 'middle', size: 8, fill: P_.thin })
   }
   if (p.n.startsWith('PUSHER')) {
     line(cx + 7.5, y + 6, cx + 7.5, y + p.h - 4, { stroke: P_.ghost, dash: '3 3' })
