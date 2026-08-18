@@ -287,8 +287,19 @@ export const BOOTH_CHANNELS: Record<EvidenceClass, EvidenceProfile> = {
     observationCoverage: 1,
     fabricationCost: 2,
   },
-  /** NOT WIRED. Profiled as it would be if installed by the machine owner on
-   *  every slot: sees everything, hard to tamper with, and still theirs. */
+  /**
+   * NOT WIRED, AND NOT PLANNED (decision, 2026-08-18).
+   *
+   * Profiled as it would be if installed by the machine owner on every slot:
+   * sees everything, hard to tamper with, and still theirs. `independence: 1`
+   * is the whole story — it compiles to E2, exactly like the free channel we
+   * already have, so buying and gluing it in would cost money and change no
+   * decision this module makes.
+   *
+   * The booth therefore runs on `confirmed-by-sale` and stays E2 until an
+   * observer exists that the machine's owner does not control. Kept in the
+   * table because the profile is the argument for not buying it.
+   */
   instrumented: {
     independence: 1,
     reproducibility: 0,
@@ -302,6 +313,22 @@ export const BOOTH_CHANNELS: Record<EvidenceClass, EvidenceProfile> = {
  * What the ordinal ladder got wrong, as data rather than as an argument.
  * Kept as an export so the claim is checkable and so a future channel change
  * has to face it.
+ */
+/**
+ * Why the on-chain payment does not upgrade the class.
+ *
+ * `confirmed-by-sale` leans on a payment that settled on a public chain, and
+ * anyone can recompute that — which looks like the reproducibility that rescues
+ * a related-party issuer in the digital lane. It is not, and the distinction is
+ * the one this whole module exists to hold.
+ *
+ * What the payment proves is that money moved. What the buyer paid for is that
+ * an item came out of the machine, and no amount of chain data re-derives a
+ * dispense that happened once in a corridor. Treating a reproducible payment as
+ * evidence of an unreproducible delivery is the exact substitution — a strong
+ * dimension covering for a missing one — that the ordinal ladder made easy and
+ * this profile refuses. Hence `reproducibility: 1` rather than 3: the claim is
+ * a hybrid, and it is scored at its weaker half.
  */
 export function boothChannelClasses(): Record<EvidenceClass, EvidenceClass5> {
   return {
